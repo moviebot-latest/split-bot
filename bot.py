@@ -4,34 +4,38 @@ import math
 import asyncio
 import subprocess
 from pyrogram import Client, filters
-from pyrogram.types import Message
 
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-app = Client("split-bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+app = Client("ultra-bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+
+DOWNLOAD_DIR = "downloads"
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 user_files = {}
+user_queue = set()
 
-# 🔥 Progress animation
-async def progress_bar(message, current, total, start):
-    now = time.time()
-    diff = now - start
-    if diff == 0:
+
+# ================= PROGRESS =================
+async def progress(current, total, message, start):
+    if not isinstance(total, (int, float)) or total == 0:
         return
 
-    percentage = current * 100 / total
-    speed = current / diff
+    now = time.time()
+    diff = now - start
+    speed = current / diff if diff > 0 else 0
     eta = (total - current) / speed if speed > 0 else 0
 
-    bar = "█" * int(percentage / 5) + "░" * (20 - int(percentage / 5))
+    percent = current * 100 / total
+    bar = "█" * int(percent // 5) + "░" * (20 - int(percent // 5))
 
     text = f"""
-🚀 **Processing...**
-[{bar}] {percentage:.2f}%
+🚀 Progress
+[{bar}] {percent:.1f}%
 
-⚡ Speed: {speed/1024:.2f} KB/s
+⚡ {speed/1024:.2f} KB/s
 ⏳ ETA: {int(eta)} sec
 """
 
@@ -40,118 +44,155 @@ async def progress_bar(message, current, total, start):
     except:
         pass
 
-# ✅ START COMMAND
+
+# ================= START =================
 @app.on_message(filters.command("start"))
-async def start(client, message: Message):
-    await message.reply_text(
-        "👋 Send video\n\n"
-        "Use:\n"
-        "👉 /split 3 (parts)\n"
-        "👉 /splitmin 2 (minutes)"
+async def start(client, message):
+    await message.reply(
+        "🔥 ULTRA BOT READY\n\n"
+        "Send video → /split 2\n"
+        "or /splitmin 1"
     )
 
-# ✅ RECEIVE VIDEO
-@app.on_message(filters.video)
-async def video_handler(client, message: Message):
-    msg = await message.reply("📥 Downloading video...")
+
+# ================= RECEIVE =================
+@app.on_message(filters.video | filters.document)
+async def receive(client, message):
+    if message.from_user.id in user_queue:
+        return await message.reply("⏳ Wait previous task finish")
+
+    status = await message.reply("📥 Downloading...")
 
     start = time.time()
 
     file_path = await message.download(
-        progress=progress_bar,
-        progress_args=(msg, start)
+        file_name=f"{DOWNLOAD_DIR}/video_{message.id}.mp4",
+        progress=progress,
+        progress_args=(status, start)
     )
 
     user_files[message.from_user.id] = file_path
 
-    await msg.edit("✅ Video received!\nNow send /split 2")
+    await status.edit("✅ Download done!\n👉 Send /split 2")
 
-# 🔥 SPLIT BY PARTS
+
+# ================= DURATION =================
+def get_duration(file):
+    try:
+        return float(subprocess.check_output([
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            file
+        ]).decode().strip())
+    except:
+        return None
+
+
+# ================= SPLIT =================
 @app.on_message(filters.command("split"))
-async def split_handler(client, message: Message):
-    user_id = message.from_user.id
+async def split(client, message):
+    uid = message.from_user.id
 
-    if user_id not in user_files:
+    if uid in user_queue:
+        return await message.reply("⏳ Already processing")
+
+    if uid not in user_files:
         return await message.reply("❌ Send video first")
 
-    parts = int(message.command[1])
-    input_file = user_files[user_id]
+    user_queue.add(uid)
 
-    msg = await message.reply("✂️ Splitting video...")
+    try:
+        parts = int(message.command[1])
+    except:
+        user_queue.remove(uid)
+        return await message.reply("❌ Use /split 2")
 
-    # duration
-    cmd = [
-        "ffprobe", "-v", "error", "-show_entries",
-        "format=duration", "-of",
-        "default=noprint_wrappers=1:nokey=1", input_file
-    ]
-    duration = float(subprocess.check_output(cmd).decode().strip())
+    file = user_files[uid]
+    duration = get_duration(file)
 
-    part_duration = duration / parts
+    if not duration:
+        user_queue.remove(uid)
+        return await message.reply("❌ Video error")
+
+    part_time = duration / parts
+    msg = await message.reply("✂️ Splitting...")
 
     for i in range(parts):
-        start_time = i * part_duration
-        output = f"part_{i+1}.mp4"
+        await msg.edit(f"✂️ Part {i+1}/{parts}")
 
-        cmd = [
-            "ffmpeg",
-            "-i", input_file,
-            "-ss", str(start_time),
-            "-t", str(part_duration),
-            "-c", "copy",
-            output
-        ]
+        out = f"{DOWNLOAD_DIR}/part_{i}.mp4"
 
-        subprocess.run(cmd)
+        subprocess.run([
+            "ffmpeg", "-i", file,
+            "-ss", str(i * part_time),
+            "-t", str(part_time),
+            "-c", "copy", out
+        ])
 
-        await message.reply_video(output)
-        os.remove(output)
+        await message.reply_video(out)
 
-    await msg.edit("✅ Done splitting!")
+        os.remove(out)
 
-# 🔥 SPLIT BY MINUTES
+    os.remove(file)
+    user_files.pop(uid)
+    user_queue.remove(uid)
+
+    await msg.edit("✅ Done!")
+
+
+# ================= SPLIT MIN =================
 @app.on_message(filters.command("splitmin"))
-async def splitmin_handler(client, message: Message):
-    user_id = message.from_user.id
+async def splitmin(client, message):
+    uid = message.from_user.id
 
-    if user_id not in user_files:
+    if uid in user_queue:
+        return await message.reply("⏳ Wait...")
+
+    if uid not in user_files:
         return await message.reply("❌ Send video first")
 
-    minutes = int(message.command[1])
-    input_file = user_files[user_id]
+    user_queue.add(uid)
 
-    msg = await message.reply("✂️ Splitting by minutes...")
+    try:
+        minutes = int(message.command[1])
+    except:
+        user_queue.remove(uid)
+        return await message.reply("❌ Use /splitmin 1")
 
-    # duration
-    cmd = [
-        "ffprobe", "-v", "error", "-show_entries",
-        "format=duration", "-of",
-        "default=noprint_wrappers=1:nokey=1", input_file
-    ]
-    duration = float(subprocess.check_output(cmd).decode().strip())
+    file = user_files[uid]
+    duration = get_duration(file)
 
-    part_duration = minutes * 60
-    parts = math.ceil(duration / part_duration)
+    if not duration:
+        user_queue.remove(uid)
+        return await message.reply("❌ Error")
+
+    part_time = minutes * 60
+    parts = math.ceil(duration / part_time)
+
+    msg = await message.reply("✂️ Splitting...")
 
     for i in range(parts):
-        start_time = i * part_duration
-        output = f"part_{i+1}.mp4"
+        await msg.edit(f"✂️ Part {i+1}/{parts}")
 
-        cmd = [
-            "ffmpeg",
-            "-i", input_file,
-            "-ss", str(start_time),
-            "-t", str(part_duration),
-            "-c", "copy",
-            output
-        ]
+        out = f"{DOWNLOAD_DIR}/min_{i}.mp4"
 
-        subprocess.run(cmd)
+        subprocess.run([
+            "ffmpeg", "-i", file,
+            "-ss", str(i * part_time),
+            "-t", str(part_time),
+            "-c", "copy", out
+        ])
 
-        await message.reply_video(output)
-        os.remove(output)
+        await message.reply_video(out)
+        os.remove(out)
 
-    await msg.edit("✅ Done splitting!")
+    os.remove(file)
+    user_files.pop(uid)
+    user_queue.remove(uid)
 
-# 🚀 RUN
+    await msg.edit("✅ Done!")
+
+
+# ================= RUN =================
 app.run()
