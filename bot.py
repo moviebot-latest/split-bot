@@ -1,121 +1,91 @@
 import os
-import asyncio
 import subprocess
 from pyrogram import Client, filters
-from pyrogram.types import Message
 
-API_ID = int(os.getenv("API_ID"))
-API_HASH = os.getenv("API_HASH")
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+API_ID = int(os.environ.get("API_ID"))
+API_HASH = os.environ.get("API_HASH")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
-bot = Client("split-bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+app = Client("video_split_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-FFMPEG = "./ffmpeg"
+USER_VIDEOS = {}
 
-# store user video
-USER_VIDEO = {}
+# START COMMAND
+@app.on_message(filters.command("start"))
+async def start(client, message):
+    await message.reply_text("👋 Send a video then use /split 2 (example)")
 
-@bot.on_message(filters.command("start"))
-async def start(_, msg: Message):
-    await msg.reply("👋 Send video then use:\n\n/split 3 (parts)\n/splitmin 2 (minutes)")
+# SAVE VIDEO
+@app.on_message(filters.video)
+async def save_video(client, message):
+    msg = await message.reply("📥 Downloading video...")
+    
+    file_path = await message.download()
+    USER_VIDEOS[message.chat.id] = file_path
 
-@bot.on_message(filters.video)
-async def save_video(_, msg: Message):
-    file = await msg.download()
-    USER_VIDEO[msg.from_user.id] = file
-    await msg.reply("✅ Video received!\nNow send /split 3")
+    await msg.edit("✅ Video saved!\nNow send /split 2")
 
-# SPLIT BY PARTS
-@bot.on_message(filters.command("split"))
-async def split_parts(_, msg: Message):
-    user_id = msg.from_user.id
+# SPLIT FUNCTION
+def split_video(input_file, parts):
+    duration_cmd = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        input_file
+    ]
+    
+    duration = float(subprocess.check_output(duration_cmd).decode().strip())
+    part_duration = duration / parts
 
-    if user_id not in USER_VIDEO:
-        return await msg.reply("❌ Send video first")
-
-    try:
-        parts = int(msg.command[1])
-    except:
-        return await msg.reply("Usage: /split 3")
-
-    file = USER_VIDEO[user_id]
-
-    # get duration
-    result = subprocess.run(
-        [FFMPEG.replace("ffmpeg", "ffprobe"), "-i", file],
-        stderr=subprocess.PIPE,
-        text=True
-    )
-
-    import re
-    duration = re.search(r"Duration: (\d+):(\d+):(\d+)", result.stderr)
-    h, m, s = map(int, duration.groups())
-    total_sec = h*3600 + m*60 + s
-
-    part_duration = total_sec // parts
-
-    await msg.reply(f"⚡ Splitting into {parts} parts...")
+    output_files = []
 
     for i in range(parts):
         start = i * part_duration
-        out = f"part_{i}.mp4"
+        output = f"part_{i+1}.mp4"
 
         cmd = [
-            FFMPEG,
+            "ffmpeg",
+            "-i", input_file,
             "-ss", str(start),
-            "-i", file,
             "-t", str(part_duration),
             "-c", "copy",
-            out
+            output
         ]
 
         subprocess.run(cmd)
+        output_files.append(output)
 
-        await msg.reply_video(out, caption=f"Part {i+1}")
-        os.remove(out)
+    return output_files
 
-# SPLIT BY MINUTES
-@bot.on_message(filters.command("splitmin"))
-async def split_minutes(_, msg: Message):
-    user_id = msg.from_user.id
+# SPLIT COMMAND
+@app.on_message(filters.command("split"))
+async def split_cmd(client, message):
+    try:
+        parts = int(message.command[1])
+    except:
+        return await message.reply("❌ Use like: /split 2")
 
-    if user_id not in USER_VIDEO:
-        return await msg.reply("❌ Send video first")
+    if message.chat.id not in USER_VIDEOS:
+        return await message.reply("⚠️ First send a video")
+
+    input_file = USER_VIDEOS[message.chat.id]
+
+    msg = await message.reply("⚡ Splitting video...")
 
     try:
-        minutes = int(msg.command[1])
-    except:
-        return await msg.reply("Usage: /splitmin 2")
+        files = split_video(input_file, parts)
 
-    file = USER_VIDEO[user_id]
-    sec = minutes * 60
+        for i, file in enumerate(files):
+            await message.reply_video(file, caption=f"Part {i+1}")
+            os.remove(file)
 
-    await msg.reply(f"⚡ Splitting every {minutes} min...")
+        os.remove(input_file)
+        USER_VIDEOS.pop(message.chat.id)
 
-    i = 0
-    start = 0
+        await msg.delete()
 
-    while True:
-        out = f"chunk_{i}.mp4"
+    except Exception as e:
+        await message.reply(f"❌ Error: {e}")
 
-        cmd = [
-            FFMPEG,
-            "-ss", str(start),
-            "-i", file,
-            "-t", str(sec),
-            "-c", "copy",
-            out
-        ]
-
-        subprocess.run(cmd)
-
-        if not os.path.exists(out) or os.path.getsize(out) == 0:
-            break
-
-        await msg.reply_video(out, caption=f"Part {i+1}")
-        os.remove(out)
-
-        start += sec
-        i += 1
-
-bot.run()
+# RUN BOT
+app.run()
