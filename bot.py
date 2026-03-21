@@ -1,7 +1,10 @@
-import os, time, math, asyncio, random, subprocess, threading
+import os, time, math, random, subprocess, threading, asyncio
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pyrogram import Client, filters
 from pyrogram.types import Message
+
+# ✅ FIX EVENT LOOP (IMPORTANT)
+asyncio.set_event_loop(asyncio.new_event_loop())
 
 # ---------------- CONFIG ----------------
 API_ID = int(os.getenv("API_ID"))
@@ -26,24 +29,9 @@ def get_size_mb(file):
 
 def generate_thumb(video, out):
     dur = get_duration(video)
-    if dur < 2:
-        t = 1
-    else:
-        t = random.randint(1, int(dur)-1)
+    t = random.randint(1, max(2, int(dur)-1))
     cmd = f'ffmpeg -ss {t} -i "{video}" -frames:v 1 "{out}" -y'
     subprocess.run(cmd, shell=True)
-
-# ---------------- ANIMATION ----------------
-
-async def animate(msg, text):
-    dots = ["", ".", "..", "..."]
-    for _ in range(3):
-        for d in dots:
-            try:
-                await msg.edit(text + d)
-                await asyncio.sleep(1.5)
-            except:
-                pass
 
 # ---------------- VIDEO RECEIVE ----------------
 
@@ -56,15 +44,14 @@ async def video_handler(client, message: Message):
     user_video[message.from_user.id] = path
 
     size = get_size_mb(path)
-    t = time.time() - start
-    speed = size / t if t > 0 else 0
+    speed = size / (time.time() - start)
 
     await msg.edit(
-        f"✅ Video saved\n💾 {size:.2f} MB\n⚡ {speed:.2f} MB/s\n\nUse:\n"
+        f"✅ Video saved\n💾 {size:.2f} MB\n⚡ {speed:.2f} MB/s\n\n"
         f"/split 3\n/splitmin 3\n/splitmb 200"
     )
 
-# ---------------- PROCESS SPLIT ----------------
+# ---------------- PROCESS ----------------
 
 async def process_split(message, files):
     total = len(files)
@@ -73,19 +60,17 @@ async def process_split(message, files):
         thumb = f + ".jpg"
         generate_thumb(f, thumb)
 
-        size = get_size_mb(f)
-
         await message.reply_video(
             f,
             thumb=thumb,
-            caption=f"📦 Part {i+1}/{total}\n💾 {size:.2f} MB"
+            caption=f"📦 Part {i+1}/{total}"
         )
 
         os.remove(f)
         if os.path.exists(thumb):
             os.remove(thumb)
 
-# ---------------- SPLIT BY PARTS ----------------
+# ---------------- SPLIT ----------------
 
 @app.on_message(filters.command("split"))
 async def split_cmd(client, message: Message):
@@ -99,9 +84,7 @@ async def split_cmd(client, message: Message):
 
     duration = get_duration(file)
     part_time = duration / parts
-
     files = []
-    start_time = time.time()
 
     for i in range(parts):
         out = f"output/part_{i+1}.mp4"
@@ -109,7 +92,7 @@ async def split_cmd(client, message: Message):
         subprocess.run(cmd, shell=True)
 
         files.append(out)
-        await msg.edit(f"✂️ Splitting Part {i+1}/{parts}")
+        await msg.edit(f"✂️ Splitting {i+1}/{parts}")
 
     await msg.edit("📤 Uploading...")
     await process_split(message, files)
@@ -117,9 +100,9 @@ async def split_cmd(client, message: Message):
     os.remove(file)
     del user_video[message.from_user.id]
 
-    await msg.edit(f"✅ Done in {int(time.time()-start_time)}s")
+    await msg.edit("✅ Done")
 
-# ---------------- SPLIT BY MINUTES ----------------
+# ---------------- SPLIT MIN ----------------
 
 @app.on_message(filters.command("splitmin"))
 async def split_min(client, message: Message):
@@ -153,7 +136,7 @@ async def split_min(client, message: Message):
 
     await msg.edit("✅ Done")
 
-# ---------------- SPLIT BY SIZE ----------------
+# ---------------- SPLIT MB ----------------
 
 @app.on_message(filters.command("splitmb"))
 async def split_mb(client, message: Message):
@@ -163,16 +146,13 @@ async def split_mb(client, message: Message):
     mb = int(message.command[1])
     file = user_video[message.from_user.id]
 
-    msg = await message.reply("✂️ Calculating...")
-
     size = get_size_mb(file)
     parts = math.ceil(size / mb)
 
-    await msg.edit(f"✂️ Splitting into {parts} parts...")
-    message.command = ["split", str(parts)]  # reuse
+    message.command = ["split", str(parts)]
     await split_cmd(client, message)
 
-# ---------------- WEB SERVER (RENDER FIX) ----------------
+# ---------------- WEB SERVER ----------------
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
