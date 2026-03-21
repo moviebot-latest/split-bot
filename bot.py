@@ -1,15 +1,14 @@
 import os, time, math, random, subprocess, threading, asyncio
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
-# ✅ FIX EVENT LOOP (IMPORTANT)
+# ✅ FIX EVENT LOOP
 asyncio.set_event_loop(asyncio.new_event_loop())
 
 # ---------------- CONFIG ----------------
-API_ID = int(os.getenv("API_ID"))
-API_HASH = os.getenv("API_HASH")
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+API_ID = int(os.getenv("API_ID", "0"))
+API_HASH = os.getenv("API_HASH", "")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
 app = Client("split-bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
@@ -152,20 +151,27 @@ async def split_mb(client, message: Message):
     message.command = ["split", str(parts)]
     await split_cmd(client, message)
 
-# ---------------- WEB SERVER ----------------
+# ---------------- WEB SERVER (FASTAPI) ----------------
 
-class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Bot is running")
+from fastapi import FastAPI
+import uvicorn
+
+web_app = FastAPI()
+
+@web_app.get("/")
+def home():
+    return {"status": "running"}
 
 def run_web():
     port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(("0.0.0.0", port), Handler)
-    server.serve_forever()
-
-threading.Thread(target=run_web).start()
+    uvicorn.run(web_app, host="0.0.0.0", port=port)
 
 # ---------------- START ----------------
-app.run()
+
+def start_all():
+    threading.Thread(target=run_web).start()
+    print("🚀 BOT STARTING...")
+    app.run()
+
+if __name__ == "__main__":
+    start_all()
