@@ -1,15 +1,14 @@
-import os, time, math, random, subprocess, threading, asyncio
+import os, asyncio, math, subprocess
 from pyrogram import Client, filters
 from pyrogram.types import Message
+from aiohttp import web
 
-# ✅ FIX EVENT LOOP
-asyncio.set_event_loop(asyncio.new_event_loop())
+# ================= ENV =================
+API_ID = int(os.getenv("API_ID"))
+API_HASH = os.getenv("API_HASH")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# ---------------- CONFIG ----------------
-API_ID = int(os.getenv("API_ID", "0"))
-API_HASH = os.getenv("API_HASH", "")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-
+# ================= BOT =================
 app = Client("split-bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 os.makedirs("downloads", exist_ok=True)
@@ -17,161 +16,123 @@ os.makedirs("output", exist_ok=True)
 
 user_video = {}
 
-# ---------------- UTIL ----------------
+# ================= WEB SERVER =================
+async def handle(request):
+    return web.Response(text="Bot Running 🚀")
 
-def get_duration(file):
-    cmd = f'ffprobe -i "{file}" -show_entries format=duration -v quiet -of csv="p=0"'
-    return float(subprocess.getoutput(cmd))
+async def start_web():
+    port = int(os.environ.get("PORT", 10000))
+    app_web = web.Application()
+    app_web.router.add_get("/", handle)
+    runner = web.AppRunner(app_web)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
 
-def get_size_mb(file):
-    return os.path.getsize(file) / (1024*1024)
+# ================= COMMAND =================
+@app.on_message(filters.command("start"))
+async def start(_, msg: Message):
+    await msg.reply_text("🔥 Send Video\nUse:\n/split 3\n/splitmin 3\n/splitmb 200")
 
-def generate_thumb(video, out):
-    dur = get_duration(video)
-    t = random.randint(1, max(2, int(dur)-1))
-    cmd = f'ffmpeg -ss {t} -i "{video}" -frames:v 1 "{out}" -y'
-    subprocess.run(cmd, shell=True)
-
-# ---------------- VIDEO RECEIVE ----------------
-
+# ================= VIDEO SAVE =================
 @app.on_message(filters.video)
-async def video_handler(client, message: Message):
-    start = time.time()
-    msg = await message.reply("📥 Downloading...")
+async def save_video(_, msg: Message):
+    file = await msg.download("downloads/")
+    user_video[msg.from_user.id] = file
+    await msg.reply_text("✅ Video saved!\nNow send split command")
 
-    path = await message.download("downloads/")
-    user_video[message.from_user.id] = path
-
-    size = get_size_mb(path)
-    speed = size / (time.time() - start)
-
-    await msg.edit(
-        f"✅ Video saved\n💾 {size:.2f} MB\n⚡ {speed:.2f} MB/s\n\n"
-        f"/split 3\n/splitmin 3\n/splitmb 200"
-    )
-
-# ---------------- PROCESS ----------------
-
-async def process_split(message, files):
-    total = len(files)
-
-    for i, f in enumerate(files):
-        thumb = f + ".jpg"
-        generate_thumb(f, thumb)
-
-        await message.reply_video(
-            f,
-            thumb=thumb,
-            caption=f"📦 Part {i+1}/{total}"
-        )
-
-        os.remove(f)
-        if os.path.exists(thumb):
-            os.remove(thumb)
-
-# ---------------- SPLIT ----------------
-
+# ================= SPLIT PARTS =================
 @app.on_message(filters.command("split"))
-async def split_cmd(client, message: Message):
-    if message.from_user.id not in user_video:
-        return await message.reply("❌ Send video first")
+async def split_parts(_, msg: Message):
+    if msg.from_user.id not in user_video:
+        return await msg.reply_text("❌ Send video first")
 
-    parts = int(message.command[1])
-    file = user_video[message.from_user.id]
+    parts = int(msg.command[1])
+    file = user_video[msg.from_user.id]
 
-    msg = await message.reply("✂️ Splitting...")
+    await msg.reply_text("✂️ Splitting...")
 
-    duration = get_duration(file)
+    duration = float(subprocess.getoutput(
+        f'ffprobe -i "{file}" -show_entries format=duration -v quiet -of csv="p=0"'))
+
     part_time = duration / parts
-    files = []
 
+    files = []
     for i in range(parts):
         out = f"output/part_{i+1}.mp4"
-        cmd = f'ffmpeg -y -ss {i*part_time} -i "{file}" -t {part_time} -c copy "{out}"'
-        subprocess.run(cmd, shell=True)
-
+        subprocess.run(
+            f'ffmpeg -y -ss {i*part_time} -i "{file}" -t {part_time} -c copy "{out}"',
+            shell=True)
         files.append(out)
-        await msg.edit(f"✂️ Splitting {i+1}/{parts}")
 
-    await msg.edit("📤 Uploading...")
-    await process_split(message, files)
+    await msg.reply_text("📤 Uploading...")
+
+    for i, f in enumerate(files):
+        await msg.reply_video(f, caption=f"📦 Part {i+1}/{len(files)}")
+        os.remove(f)
 
     os.remove(file)
-    del user_video[message.from_user.id]
+    del user_video[msg.from_user.id]
 
-    await msg.edit("✅ Done")
+    await msg.reply_text("✅ Done")
 
-# ---------------- SPLIT MIN ----------------
-
+# ================= SPLIT MIN =================
 @app.on_message(filters.command("splitmin"))
-async def split_min(client, message: Message):
-    if message.from_user.id not in user_video:
-        return await message.reply("❌ Send video first")
+async def split_min(_, msg: Message):
+    if msg.from_user.id not in user_video:
+        return await msg.reply_text("❌ Send video first")
 
-    minutes = float(message.command[1])
-    file = user_video[message.from_user.id]
+    minutes = float(msg.command[1])
+    file = user_video[msg.from_user.id]
 
-    msg = await message.reply("✂️ Splitting...")
+    await msg.reply_text("✂️ Splitting...")
 
-    duration = get_duration(file)
+    duration = float(subprocess.getoutput(
+        f'ffprobe -i "{file}" -show_entries format=duration -v quiet -of csv="p=0"'))
+
     part_time = minutes * 60
     parts = math.ceil(duration / part_time)
 
     files = []
-
     for i in range(parts):
         out = f"output/part_{i+1}.mp4"
-        cmd = f'ffmpeg -y -ss {i*part_time} -i "{file}" -t {part_time} -c copy "{out}"'
-        subprocess.run(cmd, shell=True)
-
+        subprocess.run(
+            f'ffmpeg -y -ss {i*part_time} -i "{file}" -t {part_time} -c copy "{out}"',
+            shell=True)
         files.append(out)
-        await msg.edit(f"✂️ Splitting {i+1}/{parts}")
 
-    await msg.edit("📤 Uploading...")
-    await process_split(message, files)
+    await msg.reply_text("📤 Uploading...")
+
+    for i, f in enumerate(files):
+        await msg.reply_video(f, caption=f"📦 Part {i+1}/{len(files)}")
+        os.remove(f)
 
     os.remove(file)
-    del user_video[message.from_user.id]
+    del user_video[msg.from_user.id]
 
-    await msg.edit("✅ Done")
+    await msg.reply_text("✅ Done")
 
-# ---------------- SPLIT MB ----------------
-
+# ================= SPLIT MB =================
 @app.on_message(filters.command("splitmb"))
-async def split_mb(client, message: Message):
-    if message.from_user.id not in user_video:
-        return await message.reply("❌ Send video first")
+async def split_mb(_, msg: Message):
+    if msg.from_user.id not in user_video:
+        return await msg.reply_text("❌ Send video first")
 
-    mb = int(message.command[1])
-    file = user_video[message.from_user.id]
+    mb = int(msg.command[1])
+    file = user_video[msg.from_user.id]
 
-    size = get_size_mb(file)
+    size = os.path.getsize(file) / (1024*1024)
     parts = math.ceil(size / mb)
 
-    message.command = ["split", str(parts)]
-    await split_cmd(client, message)
+    msg.command = ["split", str(parts)]
+    await split_parts(_, msg)
 
-# ---------------- WEB SERVER (FASTAPI) ----------------
-
-from fastapi import FastAPI
-import uvicorn
-
-web_app = FastAPI()
-
-@web_app.get("/")
-def home():
-    return {"status": "running"}
-
-def run_web():
-    port = int(os.environ.get("PORT", 10000))
-    uvicorn.run(web_app, host="0.0.0.0", port=port)
-
-# ---------------- START ----------------
-
-def start_all():
-    threading.Thread(target=run_web).start()
-    print("🚀 BOT STARTING...")
-    app.run()
+# ================= MAIN =================
+async def main():
+    await start_web()
+    await app.start()
+    print("🚀 Bot Started")
+    await asyncio.Event().wait()
 
 if __name__ == "__main__":
-    start_all()
+    asyncio.run(main())
