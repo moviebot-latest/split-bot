@@ -1,53 +1,65 @@
-import os, asyncio, math, subprocess
-from pyrogram import Client, filters
+import os
+import asyncio
+import math
+import subprocess
+from pyrogram import Client, filters, idle
 from pyrogram.types import Message
 from aiohttp import web
 
-# ================= ENV =================
+# ===== ENV =====
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# ================= BOT =================
-app = Client("split-bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+# ===== BOT =====
+app = Client(
+    "split-bot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN
+)
 
 os.makedirs("downloads", exist_ok=True)
 os.makedirs("output", exist_ok=True)
 
 user_video = {}
 
-# ================= WEB SERVER =================
-async def handle(request):
-    return web.Response(text="Bot Running 🚀")
+# ===== WEB SERVER (FIX FOR RENDER) =====
+async def home(request):
+    return web.Response(text="Bot Running 🔥")
 
 async def start_web():
     port = int(os.environ.get("PORT", 10000))
-    app_web = web.Application()
-    app_web.router.add_get("/", handle)
-    runner = web.AppRunner(app_web)
+    web_app = web.Application()
+    web_app.router.add_get("/", home)
+    runner = web.AppRunner(web_app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
-# ================= COMMAND =================
+# ===== START =====
 @app.on_message(filters.command("start"))
-async def start(_, msg: Message):
+async def start_cmd(_, msg: Message):
     await msg.reply_text("🔥 Send Video\nUse:\n/split 3\n/splitmin 3\n/splitmb 200")
 
-# ================= VIDEO SAVE =================
+# ===== SAVE VIDEO =====
 @app.on_message(filters.video)
 async def save_video(_, msg: Message):
     file = await msg.download("downloads/")
     user_video[msg.from_user.id] = file
     await msg.reply_text("✅ Video saved!\nNow send split command")
 
-# ================= SPLIT PARTS =================
+# ===== SPLIT PARTS =====
 @app.on_message(filters.command("split"))
 async def split_parts(_, msg: Message):
     if msg.from_user.id not in user_video:
         return await msg.reply_text("❌ Send video first")
 
-    parts = int(msg.command[1])
+    try:
+        parts = int(msg.command[1])
+    except:
+        return await msg.reply_text("❌ Use like /split 3")
+
     file = user_video[msg.from_user.id]
 
     await msg.reply_text("✂️ Splitting...")
@@ -56,13 +68,14 @@ async def split_parts(_, msg: Message):
         f'ffprobe -i "{file}" -show_entries format=duration -v quiet -of csv="p=0"'))
 
     part_time = duration / parts
-
     files = []
+
     for i in range(parts):
         out = f"output/part_{i+1}.mp4"
         subprocess.run(
             f'ffmpeg -y -ss {i*part_time} -i "{file}" -t {part_time} -c copy "{out}"',
-            shell=True)
+            shell=True
+        )
         files.append(out)
 
     await msg.reply_text("📤 Uploading...")
@@ -76,13 +89,17 @@ async def split_parts(_, msg: Message):
 
     await msg.reply_text("✅ Done")
 
-# ================= SPLIT MIN =================
+# ===== SPLIT MIN =====
 @app.on_message(filters.command("splitmin"))
 async def split_min(_, msg: Message):
     if msg.from_user.id not in user_video:
         return await msg.reply_text("❌ Send video first")
 
-    minutes = float(msg.command[1])
+    try:
+        minutes = float(msg.command[1])
+    except:
+        return await msg.reply_text("❌ Use like /splitmin 3")
+
     file = user_video[msg.from_user.id]
 
     await msg.reply_text("✂️ Splitting...")
@@ -94,11 +111,13 @@ async def split_min(_, msg: Message):
     parts = math.ceil(duration / part_time)
 
     files = []
+
     for i in range(parts):
         out = f"output/part_{i+1}.mp4"
         subprocess.run(
             f'ffmpeg -y -ss {i*part_time} -i "{file}" -t {part_time} -c copy "{out}"',
-            shell=True)
+            shell=True
+        )
         files.append(out)
 
     await msg.reply_text("📤 Uploading...")
@@ -112,27 +131,30 @@ async def split_min(_, msg: Message):
 
     await msg.reply_text("✅ Done")
 
-# ================= SPLIT MB =================
+# ===== SPLIT MB =====
 @app.on_message(filters.command("splitmb"))
 async def split_mb(_, msg: Message):
     if msg.from_user.id not in user_video:
         return await msg.reply_text("❌ Send video first")
 
-    mb = int(msg.command[1])
-    file = user_video[msg.from_user.id]
+    try:
+        mb = int(msg.command[1])
+    except:
+        return await msg.reply_text("❌ Use like /splitmb 200")
 
-    size = os.path.getsize(file) / (1024*1024)
+    file = user_video[msg.from_user.id]
+    size = os.path.getsize(file) / (1024 * 1024)
     parts = math.ceil(size / mb)
 
     msg.command = ["split", str(parts)]
     await split_parts(_, msg)
 
-# ================= MAIN =================
+# ===== MAIN (FINAL FIX) =====
 async def main():
     await start_web()
     await app.start()
-    print("🚀 Bot Started")
-    await asyncio.Event().wait()
+    print("🔥 Bot Started Successfully")
+    await idle()
 
 if __name__ == "__main__":
     asyncio.run(main())
