@@ -1,7 +1,9 @@
-import os, time, math, asyncio, random, subprocess
+import os, time, math, asyncio, random, subprocess, threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
+# ---------------- CONFIG ----------------
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -13,25 +15,25 @@ os.makedirs("output", exist_ok=True)
 
 user_video = {}
 
-# -------------------- UTIL --------------------
+# ---------------- UTIL ----------------
 
 def get_duration(file):
     cmd = f'ffprobe -i "{file}" -show_entries format=duration -v quiet -of csv="p=0"'
     return float(subprocess.getoutput(cmd))
-
-def human_time(sec):
-    return f"{int(sec)}s"
 
 def get_size_mb(file):
     return os.path.getsize(file) / (1024*1024)
 
 def generate_thumb(video, out):
     dur = get_duration(video)
-    rand = random.randint(1, int(dur)-1)
-    cmd = f'ffmpeg -ss {rand} -i "{video}" -frames:v 1 "{out}" -y'
+    if dur < 2:
+        t = 1
+    else:
+        t = random.randint(1, int(dur)-1)
+    cmd = f'ffmpeg -ss {t} -i "{video}" -frames:v 1 "{out}" -y'
     subprocess.run(cmd, shell=True)
 
-# -------------------- ANIMATION --------------------
+# ---------------- ANIMATION ----------------
 
 async def animate(msg, text):
     dots = ["", ".", "..", "..."]
@@ -43,7 +45,7 @@ async def animate(msg, text):
             except:
                 pass
 
-# -------------------- VIDEO RECEIVE --------------------
+# ---------------- VIDEO RECEIVE ----------------
 
 @app.on_message(filters.video)
 async def video_handler(client, message: Message):
@@ -57,9 +59,12 @@ async def video_handler(client, message: Message):
     t = time.time() - start
     speed = size / t if t > 0 else 0
 
-    await msg.edit(f"✅ Video saved\n💾 {size:.2f} MB\n⚡ {speed:.2f} MB/s\n\nUse:\n/split 3\n/splitmin 3\n/splitmb 200")
+    await msg.edit(
+        f"✅ Video saved\n💾 {size:.2f} MB\n⚡ {speed:.2f} MB/s\n\nUse:\n"
+        f"/split 3\n/splitmin 3\n/splitmb 200"
+    )
 
-# -------------------- SPLIT CORE --------------------
+# ---------------- PROCESS SPLIT ----------------
 
 async def process_split(message, files):
     total = len(files)
@@ -80,7 +85,7 @@ async def process_split(message, files):
         if os.path.exists(thumb):
             os.remove(thumb)
 
-# -------------------- SPLIT COMMAND --------------------
+# ---------------- SPLIT BY PARTS ----------------
 
 @app.on_message(filters.command("split"))
 async def split_cmd(client, message: Message):
@@ -112,10 +117,9 @@ async def split_cmd(client, message: Message):
     os.remove(file)
     del user_video[message.from_user.id]
 
-    total_time = time.time() - start_time
-    await msg.edit(f"✅ Done in {human_time(total_time)}")
+    await msg.edit(f"✅ Done in {int(time.time()-start_time)}s")
 
-# -------------------- SPLIT MIN --------------------
+# ---------------- SPLIT BY MINUTES ----------------
 
 @app.on_message(filters.command("splitmin"))
 async def split_min(client, message: Message):
@@ -149,7 +153,7 @@ async def split_min(client, message: Message):
 
     await msg.edit("✅ Done")
 
-# -------------------- SPLIT MB --------------------
+# ---------------- SPLIT BY SIZE ----------------
 
 @app.on_message(filters.command("splitmb"))
 async def split_mb(client, message: Message):
@@ -165,8 +169,23 @@ async def split_mb(client, message: Message):
     parts = math.ceil(size / mb)
 
     await msg.edit(f"✂️ Splitting into {parts} parts...")
+    message.command = ["split", str(parts)]  # reuse
     await split_cmd(client, message)
 
-# --------------------
+# ---------------- WEB SERVER (RENDER FIX) ----------------
 
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running")
+
+def run_web():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), Handler)
+    server.serve_forever()
+
+threading.Thread(target=run_web).start()
+
+# ---------------- START ----------------
 app.run()
