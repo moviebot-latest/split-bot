@@ -345,27 +345,9 @@ async def cancel_cmd(client, message):
 
 
 # ══════════════════════════════════════════════════════════════
-#  DEBUG — catch ALL incoming messages to see what's arriving
-# ══════════════════════════════════════════════════════════════
-@app.on_message(filters.incoming)
-async def debug_all(client, message):
-    """Temporary debug handler — logs every message type."""
-    parts = []
-    parts.append(f"📨 **Message received**")
-    parts.append(f"  type: `{message.media}`")
-    if message.video:      parts.append(f"  ✅ video: `{message.video.mime_type}`  {message.video.file_size}B")
-    if message.document:   parts.append(f"  ✅ document: `{message.document.mime_type}`  {message.document.file_size}B")
-    if message.animation:  parts.append(f"  ✅ animation")
-    if message.text:       parts.append(f"  📝 text: `{message.text[:50]}`")
-    if message.forward_from or message.forward_from_chat:
-        parts.append(f"  ↩️ forwarded")
-    await message.reply("\n".join(parts))
-
-
-# ══════════════════════════════════════════════════════════════
 #  RECEIVE VIDEO — catches direct + forwarded + all formats
 # ══════════════════════════════════════════════════════════════
-@app.on_message(filters.incoming & (filters.video | filters.document | filters.animation))
+@app.on_message(filters.incoming & (filters.video | filters.document), group=-1)
 async def receive(client, message):
     uid  = message.from_user.id
     lock = _get_lock(uid)
