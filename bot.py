@@ -76,7 +76,7 @@ def _eta(s: float) -> str:
 
 def _bar(pct: float) -> str:
     n = int(pct / 100 * BAR_WIDTH)
-    return "⬛" * n + "⬜" * (BAR_WIDTH - n)
+    return "[" + "█" * n + "░" * (BAR_WIDTH - n) + "]"
 
 def _badge(pct: float) -> str:
     return ("🏁" if pct>=100 else "🔥" if pct>=80 else
@@ -202,8 +202,8 @@ async def get_duration(file: str) -> float | None:
 #  SPLIT BAR
 # ══════════════════════════════════════════════════════════════
 def _sbar(done: int, total: int, w: int = 16) -> str:
-    f = int(done / total * w)
-    return "⬛" * f + "⬜" * (w - f)
+    n = int(done / total * w)
+    return "[" + "█" * n + "░" * (w - n) + "]"
 
 async def _split_update(msg, done: int, total: int, note: str = "") -> None:
     pct = done * 100 // total
@@ -230,10 +230,10 @@ async def _upload_part(
         return False
 
     status = await message.reply(
-        f"⠋ **⬆️ Upload**  — part {num}/{total}\n"
+        f"⬆️ **Upload**  — part {num}/{total}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜\n"
-        f"  🌀 **0.0%**  ·  starting…"
+        f"[░░░░░░░░░░░░░░░░░░░░]\n"
+        f"  🌀 **0%**  ·  starting…"
     )
     _reset(uid)
     t0 = time.time()
@@ -345,14 +345,41 @@ async def cancel_cmd(client, message):
 
 
 # ══════════════════════════════════════════════════════════════
-#  RECEIVE VIDEO
+#  DEBUG — catch ALL incoming messages to see what's arriving
 # ══════════════════════════════════════════════════════════════
-@app.on_message(filters.video | filters.document)
+@app.on_message(filters.incoming)
+async def debug_all(client, message):
+    """Temporary debug handler — logs every message type."""
+    parts = []
+    parts.append(f"📨 **Message received**")
+    parts.append(f"  type: `{message.media}`")
+    if message.video:      parts.append(f"  ✅ video: `{message.video.mime_type}`  {message.video.file_size}B")
+    if message.document:   parts.append(f"  ✅ document: `{message.document.mime_type}`  {message.document.file_size}B")
+    if message.animation:  parts.append(f"  ✅ animation")
+    if message.text:       parts.append(f"  📝 text: `{message.text[:50]}`")
+    if message.forward_from or message.forward_from_chat:
+        parts.append(f"  ↩️ forwarded")
+    await message.reply("\n".join(parts))
+
+
+# ══════════════════════════════════════════════════════════════
+#  RECEIVE VIDEO — catches direct + forwarded + all formats
+# ══════════════════════════════════════════════════════════════
+@app.on_message(filters.incoming & (filters.video | filters.document | filters.animation))
 async def receive(client, message):
     uid  = message.from_user.id
     lock = _get_lock(uid)
 
-    media = message.video or message.document
+    # ── Find media in message or forwarded content ────────────
+    media = (
+        message.video or
+        message.document or
+        message.animation or
+        (message.forward_from and (
+            getattr(message, "video", None) or
+            getattr(message, "document", None)
+        ))
+    )
     if not media:
         return
 
@@ -384,7 +411,7 @@ async def receive(client, message):
     status = await message.reply(
         f"📥 **Downloading…**\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜\n"
+        f"[░░░░░░░░░░░░░░░░░░░░]\n"
         f"  🌀 **0%**  ·  {sz_str}"
     )
 
@@ -394,12 +421,18 @@ async def receive(client, message):
     _set_status(uid, "Downloading", sz_str)
     t0 = time.time()
 
+    # Immediately show "started" so user knows it's working
+    await _safe_edit(
+        status,
+        f"📥 **Downloading…**\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"[░░░░░░░░░░░░░░░░░░░░]\n"
+        f"  🌀 **0%**  ·  {sz_str}\n"
+        f"  ⏳ Starting…"
+    )
+
     try:
-        path = await message.download(
-            file_name=fname,
-            progress=progress,
-            progress_args=(status, t0, uid, "📥 Download"),
-        )
+        path = await message.download(file_name=fname)
     except Exception as e:
         _clear_status(uid)
         await _safe_edit(status, f"❌ Download failed: `{e}`")
@@ -414,12 +447,14 @@ async def receive(client, message):
     _clear_status(uid)
     user_files[uid] = path
     actual_size = _sz(os.path.getsize(path))
+    elapsed_str = _eta(time.time() - t0)
     await _safe_edit(
         status,
         f"✅ **Download complete!**\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛\n"
-        f"  🏁 **100%**  ·  {actual_size} saved\n\n"
+        f"[████████████████████]\n"
+        f"  🏁 **100%**  ·  {actual_size} saved\n"
+        f"  ⏱ Time: {elapsed_str}\n\n"
         f"👉 `/split N`  or  `/splitmin N`"
     )
 
@@ -435,7 +470,7 @@ async def _do_split(message, uid: int, seg: float, parts: int, label: str) -> No
     msg = await message.reply(
         f"✂️ **{label}**\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ **0%**\n"
+        f"[░░░░░░░░░░░░░░░░] **0%**\n"
         f"  ❌ /cancel to stop"
     )
 
@@ -486,7 +521,7 @@ async def _do_split(message, uid: int, seg: float, parts: int, label: str) -> No
             msg,
             f"🏁 **All {parts} parts done!**\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛ **100%**\n"
+            f"[████████████████] **100%**\n"
             f"  ✅ Complete"
         )
 
