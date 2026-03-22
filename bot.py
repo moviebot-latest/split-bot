@@ -64,10 +64,10 @@ def _eta(s: float) -> str:
     return f"{int(s)}s"
 
 def _bar(pct: float) -> str:
-    # ▰▱ are clearly visible on both dark & light Telegram themes
+    # ⬛⬜ large squares — clearly visible on all Telegram themes & font sizes
     n = int(pct / 100 * BAR_WIDTH)
-    e = BAR_WIDTH - n - (1 if n < BAR_WIDTH else 0)
-    return "▰" * n + ("◈" if n < BAR_WIDTH else "") + "▱" * e
+    e = BAR_WIDTH - n
+    return "⬛" * n + "⬜" * e
 
 def _badge(pct: float) -> str:
     return ("🏁" if pct>=100 else "🔥" if pct>=80 else
@@ -107,7 +107,7 @@ async def progress(
     now     = time.time()
     elapsed = max(now - start, 0.001)
 
-    if now - _last_edit.get(uid, 0.0) < THROTTLE:
+    if now - _last_edit.get(uid, 0.0) < THROTTLE and _last_edit.get(uid, 0.0) != 0.0:
         return
     _last_edit[uid] = now
 
@@ -187,7 +187,7 @@ async def make_thumb(video: str, ss: float, out: str) -> str | None:
 # ══════════════════════════════════════════════════════════════
 def _sbar(done: int, total: int, w: int = 16) -> str:
     f = int(done / total * w)
-    return "▰" * f + "▱" * (w - f)
+    return "⬛" * f + "⬜" * (w - f)
 
 async def _split_update(msg, done: int, total: int, note: str = "") -> None:
     pct  = done * 100 // total
@@ -230,7 +230,7 @@ async def _upload_part(
     status = await message.reply(
         f"⠋ **⬆️ Upload**  — part {num}/{total}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱\n"
+        f"⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜\n"
         f"  🌀 **0.0%**  ·  starting…"
     )
     _reset(uid)
@@ -282,27 +282,53 @@ async def start(client, message):
 
 
 # ══════════════════════════════════════════════════════════════
-#  RECEIVE VIDEO  — multi-user, each user independent
+#  RECEIVE VIDEO  — multi-user, handles MP4 + MKV + any video doc
 # ══════════════════════════════════════════════════════════════
 @app.on_message(filters.video | filters.document)
 async def receive(client, message):
     uid  = message.from_user.id
     lock = _get_lock(uid)
 
+    # ── Detect actual media object (video or document) ────────
+    media = message.video or message.document
+    if not media:
+        return await message.reply("❌ No file found. Send a video file.")
+
+    # ── Filter: only allow video mime types ───────────────────
+    mime = getattr(media, "mime_type", "") or ""
+    if not mime.startswith("video/"):
+        # also allow octet-stream for generic uploads
+        if mime not in ("application/octet-stream", ""):
+            return  # silently ignore non-video documents (images, pdfs etc)
+
     if lock.locked():
         return await message.reply("⏳ Your previous task is still running.")
 
+    # ── Detect extension from mime type ───────────────────────
+    ext_map = {
+        "video/mp4":        "mp4",
+        "video/x-matroska": "mkv",
+        "video/mkv":        "mkv",
+        "video/avi":        "avi",
+        "video/x-msvideo":  "avi",
+        "video/webm":       "webm",
+        "video/quicktime":  "mov",
+        "video/x-ms-wmv":   "wmv",
+    }
+    ext = ext_map.get(mime, "mp4")
+    fname = f"{DOWNLOAD_DIR}/video_{uid}_{message.id}.{ext}"
+
     status = await message.reply(
-        "⠋ **⬇️ Download**\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱\n"
-        "  🌀 **0.0%**  ·  starting…"
+        f"⠋ **⬇️ Download**\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜\n"
+        f"  🌀 **0.0%**  ·  `{mime or 'video'}` detected…"
     )
     _reset(uid)
     t0 = time.time()
 
     path = await message.download(
-        file_name=f"{DOWNLOAD_DIR}/video_{uid}_{message.id}.mp4",
+        file_name=fname,
         progress=progress,
         progress_args=(status, t0, uid, "⬇️ Download"),
     )
@@ -320,7 +346,7 @@ async def _do_split(message, uid: int, seg: float, parts: int, label: str) -> No
     msg  = await message.reply(
         f"✂️ **{label}**\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱ **0%**"
+        f"⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ **0%**"
     )
 
     try:
@@ -347,7 +373,7 @@ async def _do_split(message, uid: int, seg: float, parts: int, label: str) -> No
             msg,
             f"🏁 **All {parts} parts done!**\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰ **100%**\n  ✅ Complete"
+            f"⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛ **100%**\n  ✅ Complete"
         )
 
     except Exception as e:
