@@ -291,7 +291,7 @@ async def start(client, message):
 # ══════════════════════════════════════════════════════════════
 #  /status  — show current task info
 # ══════════════════════════════════════════════════════════════
-@app.on_message(filters.command("status"))
+@app.on_message(filters.command("status"), group=0)
 async def status_cmd(client, message):
     uid  = message.from_user.id
     lock = _get_lock(uid)
@@ -327,7 +327,7 @@ async def status_cmd(client, message):
 # ══════════════════════════════════════════════════════════════
 #  /cancel  — stop current task cleanly
 # ══════════════════════════════════════════════════════════════
-@app.on_message(filters.command("cancel"))
+@app.on_message(filters.command("cancel"), group=0)
 async def cancel_cmd(client, message):
     uid  = message.from_user.id
     lock = _get_lock(uid)
@@ -347,21 +347,26 @@ async def cancel_cmd(client, message):
 # ══════════════════════════════════════════════════════════════
 #  RECEIVE VIDEO — catches direct + forwarded + all formats
 # ══════════════════════════════════════════════════════════════
+_seen_msgs: set[int] = set()  # track message_id to prevent double processing
+
 @app.on_message(filters.incoming & (filters.video | filters.document), group=-1)
 async def receive(client, message):
     uid  = message.from_user.id
-    lock = _get_lock(uid)
 
-    # ── Find media in message or forwarded content ────────────
-    media = (
-        message.video or
-        message.document or
-        message.animation or
-        (message.forward_from and (
-            getattr(message, "video", None) or
-            getattr(message, "document", None)
-        ))
-    )
+    # ── Deduplicate by message_id — foolproof double trigger fix
+    if message.id in _seen_msgs:
+        return
+    _seen_msgs.add(message.id)
+    # Keep set small — remove old entries after 100
+    if len(_seen_msgs) > 100:
+        _seen_msgs.clear()
+
+    lock = _get_lock(uid)
+    if lock.locked():
+        return await message.reply("⏳ Task running.\n👉 /status · /cancel")
+
+    # ── Pick correct media: document over video for MKV/large files
+    media = message.document or message.video
     if not media:
         return
 
@@ -369,16 +374,18 @@ async def receive(client, message):
     file_size = getattr(media, "file_size", 0) or 0
 
     VIDEO_MIMES = (
-        "video/mp4", "video/x-matroska", "video/mkv",
-        "video/avi", "video/x-msvideo", "video/webm",
-        "video/quicktime", "video/x-ms-wmv", "video/3gpp",
-        "application/octet-stream",
+        "video/", "application/octet-stream",
     )
     if mime and not any(mime.startswith(v) for v in VIDEO_MIMES):
         return
 
-    if lock.locked():
-        return await message.reply("⏳ Your previous task is still running.\n👉 /status to check · /cancel to stop")
+    # ── Delete old file if exists ─────────────────────────────
+    if uid in user_files and os.path.exists(user_files[uid]):
+        try:
+            os.remove(user_files[uid])
+        except Exception:
+            pass
+        user_files.pop(uid, None)
 
     ext_map = {
         "video/x-matroska": "mkv", "video/mkv": "mkv",
@@ -388,30 +395,18 @@ async def receive(client, message):
     }
     ext   = ext_map.get(mime, "mp4")
     fname = f"{DOWNLOAD_DIR}/video_{uid}_{message.id}.{ext}"
+    sz_str = _sz(file_size) if file_size else "?"
 
-    sz_str = _sz(file_size) if file_size else "unknown size"
     status = await message.reply(
-        f"📥 **Downloading…**\n"
+        f"📥 **Downloading…** `{ext.upper()}` · {sz_str}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"[░░░░░░░░░░░░░░░░░░░░]\n"
-        f"  🌀 **0%**  ·  {sz_str}"
+        f"⏳ Starting…"
     )
 
-    # Clear any leftover cancel flag
     _get_cancel(uid).clear()
     _reset(uid)
     _set_status(uid, "Downloading", sz_str)
     t0 = time.time()
-
-    # Immediately show "started" so user knows it's working
-    await _safe_edit(
-        status,
-        f"📥 **Downloading…**\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"[░░░░░░░░░░░░░░░░░░░░]\n"
-        f"  🌀 **0%**  ·  {sz_str}\n"
-        f"  ⏳ Starting…"
-    )
 
     try:
         path = await message.download(file_name=fname)
@@ -422,7 +417,7 @@ async def receive(client, message):
 
     if not path or not os.path.exists(path):
         _clear_status(uid)
-        await _safe_edit(status, "❌ Download failed — file not saved.")
+        await _safe_edit(status, "❌ File not saved — try again.")
         return
 
     _reset(uid)
@@ -434,9 +429,8 @@ async def receive(client, message):
         status,
         f"✅ **Download complete!**\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"[████████████████████]\n"
-        f"  🏁 **100%**  ·  {actual_size} saved\n"
-        f"  ⏱ Time: {elapsed_str}\n\n"
+        f"  📁 `{os.path.basename(path)}`\n"
+        f"  📦 {actual_size}  ·  ⏱ {elapsed_str}\n\n"
         f"👉 `/split N`  or  `/splitmin N`"
     )
 
