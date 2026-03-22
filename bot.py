@@ -13,7 +13,6 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 app = Client(
     "ultra-bot",
     api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN,
-    workers=8,
 )
 
 DOWNLOAD_DIR = "downloads"
@@ -273,8 +272,10 @@ async def _upload_part(
 # ══════════════════════════════════════════════════════════════
 #  /start
 # ══════════════════════════════════════════════════════════════
-@app.on_message(filters.command("start"))
+@app.on_message(filters.command("start"), group=1)
 async def start(client, message):
+    if message.id in _seen_msgs: return
+    _seen_msgs.add(message.id)
     await message.reply(
         "⚡ **ULTRA BOT v5** — ready!\n\n"
         "📤 Send any **video**, then:\n"
@@ -291,8 +292,10 @@ async def start(client, message):
 # ══════════════════════════════════════════════════════════════
 #  /status  — show current task info
 # ══════════════════════════════════════════════════════════════
-@app.on_message(filters.command("status"), group=0)
+@app.on_message(filters.command("status"), group=1)
 async def status_cmd(client, message):
+    if message.id in _seen_msgs: return
+    _seen_msgs.add(message.id)
     uid  = message.from_user.id
     lock = _get_lock(uid)
     info = user_status.get(uid)
@@ -327,8 +330,10 @@ async def status_cmd(client, message):
 # ══════════════════════════════════════════════════════════════
 #  /cancel  — stop current task cleanly
 # ══════════════════════════════════════════════════════════════
-@app.on_message(filters.command("cancel"), group=0)
+@app.on_message(filters.command("cancel"), group=1)
 async def cancel_cmd(client, message):
+    if message.id in _seen_msgs: return
+    _seen_msgs.add(message.id)
     uid  = message.from_user.id
     lock = _get_lock(uid)
 
@@ -409,7 +414,11 @@ async def receive(client, message):
     t0 = time.time()
 
     try:
-        path = await message.download(file_name=fname)
+        path = await message.download(
+            file_name=fname,
+            progress=progress,
+            progress_args=(status, t0, uid, "📥 Download"),
+        )
     except Exception as e:
         _clear_status(uid)
         await _safe_edit(status, f"❌ Download failed: `{e}`")
@@ -509,13 +518,15 @@ async def _do_split(message, uid: int, seg: float, parts: int, label: str) -> No
 # ══════════════════════════════════════════════════════════════
 #  /split
 # ══════════════════════════════════════════════════════════════
-@app.on_message(filters.command("split"))
+@app.on_message(filters.command("split"), group=1)
 async def split(client, message):
     uid  = message.from_user.id
+    if message.id in _seen_msgs: return
+    _seen_msgs.add(message.id)
     lock = _get_lock(uid)
 
     if lock.locked():
-        return await message.reply("⏳ Already processing.\n👉 /status to check · /cancel to stop")
+        return await message.reply("⏳ Already processing.\n👉 /status · /cancel")
     if uid not in user_files:
         return await message.reply("❌ Send a video first.")
 
@@ -536,13 +547,15 @@ async def split(client, message):
 # ══════════════════════════════════════════════════════════════
 #  /splitmin
 # ══════════════════════════════════════════════════════════════
-@app.on_message(filters.command("splitmin"))
+@app.on_message(filters.command("splitmin"), group=1)
 async def splitmin(client, message):
     uid  = message.from_user.id
+    if message.id in _seen_msgs: return
+    _seen_msgs.add(message.id)
     lock = _get_lock(uid)
 
     if lock.locked():
-        return await message.reply("⏳ Already processing.\n👉 /status to check · /cancel to stop")
+        return await message.reply("⏳ Already processing.\n👉 /status · /cancel")
     if uid not in user_files:
         return await message.reply("❌ Send a video first.")
 
