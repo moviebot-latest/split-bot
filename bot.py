@@ -355,19 +355,20 @@ async def cancel_cmd(client, message):
 # ══════════════════════════════════════════════════════════════
 #  RECEIVE VIDEO — catches direct + forwarded + all formats
 # ══════════════════════════════════════════════════════════════
-_seen_msgs: set[int] = set()  # track message_id to prevent double processing
+_seen_msgs:  set[int]        = set()
+_seen_lock:  asyncio.Lock    = asyncio.Lock()   # atomic check+add
 
 @app.on_message(filters.incoming & (filters.video | filters.document), group=-1)
 async def receive(client, message):
-    uid  = message.from_user.id
+    uid = message.from_user.id
 
-    # ── Deduplicate by message_id — foolproof double trigger fix
-    if message.id in _seen_msgs:
-        return
-    _seen_msgs.add(message.id)
-    # Keep set small — remove old entries after 100
-    if len(_seen_msgs) > 100:
-        _seen_msgs.clear()
+    # ── Atomic dedup — Lock ensures no two coroutines pass simultaneously
+    async with _seen_lock:
+        if message.id in _seen_msgs:
+            return
+        _seen_msgs.add(message.id)
+        if len(_seen_msgs) > 200:
+            _seen_msgs.clear()
 
     lock = _get_lock(uid)
     if lock.locked():
