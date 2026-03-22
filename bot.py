@@ -240,6 +240,7 @@ async def _upload_part(
     thumb_path = f"{THUMB_DIR}/thumb_{uid}_{num}.jpg"
     thumb = await make_thumb(path, thumb_time, thumb_path)
 
+    uploaded = False
     for attempt in range(3):
         if _get_cancel(uid).is_set():
             await _safe_edit(status, "🚫 Upload cancelled.")
@@ -252,12 +253,14 @@ async def _upload_part(
                 progress=upload_progress,
                 progress_args=(status, t0, uid),
             )
-            break
+            uploaded = True
+            break  # success — stop retrying
         except FloodWait as e:
             await asyncio.sleep(e.value + 1)
         except Exception as e:
             if attempt == 2:
                 await message.reply(f"❌ Upload failed part {num}: `{e}`")
+            await asyncio.sleep(2)
 
     _reset(uid)
     if thumb and os.path.exists(thumb_path):
@@ -266,7 +269,7 @@ async def _upload_part(
         await status.delete()
     except Exception:
         pass
-    return True
+    return uploaded
 
 
 # ══════════════════════════════════════════════════════════════
