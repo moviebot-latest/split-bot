@@ -13,7 +13,6 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 app = Client(
     "ultra-bot",
     api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN,
-    # allow more concurrent workers for multi-user
     workers=8,
 )
 
@@ -22,20 +21,32 @@ THUMB_DIR    = "thumbs"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 os.makedirs(THUMB_DIR,    exist_ok=True)
 
-# per-user: stores video path
-user_files: dict[int, str] = {}
-# per-user: asyncio.Lock — true multi-user, each user has own lock
-user_locks: dict[int, asyncio.Lock] = {}
+# ── Per-user state ────────────────────────────────────────────
+user_files:  dict[int, str]            = {}  # saved video path
+user_locks:  dict[int, asyncio.Lock]   = {}  # one lock per user
+user_cancel: dict[int, asyncio.Event]  = {}  # cancel flag per user
+user_status: dict[int, dict]           = {}  # current task info
 
 def _get_lock(uid: int) -> asyncio.Lock:
     if uid not in user_locks:
         user_locks[uid] = asyncio.Lock()
     return user_locks[uid]
 
+def _get_cancel(uid: int) -> asyncio.Event:
+    if uid not in user_cancel:
+        user_cancel[uid] = asyncio.Event()
+    return user_cancel[uid]
+
+def _set_status(uid: int, task: str, detail: str = "") -> None:
+    user_status[uid] = {"task": task, "detail": detail, "since": time.time()}
+
+def _clear_status(uid: int) -> None:
+    user_status.pop(uid, None)
+
 
 # ╔══════════════════════════════════════════════════════════════╗
-#  ██  ULTRA PROGRESS ENGINE v4                                 ██
-#  ██  0.2s · EMA · count-up · flood-safe · multi-user         ██
+#  ██  ULTRA PROGRESS ENGINE v5                                 ██
+#  ██  0.2s · EMA · count-up · cancel-aware · /status          ██
 # ╚══════════════════════════════════════════════════════════════╝
 
 THROTTLE  = 0.2
@@ -64,10 +75,8 @@ def _eta(s: float) -> str:
     return f"{int(s)}s"
 
 def _bar(pct: float) -> str:
-    # ⬛⬜ large squares — clearly visible on all Telegram themes & font sizes
     n = int(pct / 100 * BAR_WIDTH)
-    e = BAR_WIDTH - n
-    return "⬛" * n + "⬜" * e
+    return "⬛" * n + "⬜" * (BAR_WIDTH - n)
 
 def _badge(pct: float) -> str:
     return ("🏁" if pct>=100 else "🔥" if pct>=80 else
@@ -80,10 +89,7 @@ def _count_up(uid: int, real: float, step: float = 1.8) -> float:
     _shown_pct[uid] = shown
     return shown
 
-
-# ── Flood-safe edit ───────────────────────────────────────────
 async def _safe_edit(message, text: str) -> None:
-    """Edit message; on FloodWait sleep & retry once; ignore no-change errors."""
     try:
         await message.edit(text)
     except FloodWait as e:
@@ -95,15 +101,18 @@ async def _safe_edit(message, text: str) -> None:
     except Exception:
         pass
 
-
-# ── Main progress callback ────────────────────────────────────
 async def progress(
     current: int, total: int,
     message, start: float,
-    uid: int = 0, mode: str = "⬇️ Download",
+    uid: int = 0, mode: str = "📥 Download",
 ) -> None:
     if not isinstance(total, (int, float)) or total <= 0:
         return
+
+    # ── Cancel check inside progress ─────────────────────────
+    if _get_cancel(uid).is_set():
+        return
+
     now     = time.time()
     elapsed = max(now - start, 0.001)
 
@@ -132,9 +141,10 @@ async def progress(
         f"{_bar(shown)}\n"
         f"  {_badge(shown)} **{shown:.1f}%**  ·  {_sz(current)} / {_sz(total)}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"  🚄 **Speed**  : `{_sz(ema)}/s`  {tier}\n"
-        f"  ⏱ **ETA**    : `{_eta(eta_sec)}`\n"
-        f"  ⏳ **Elapsed** : `{_eta(elapsed)}`"
+        f"  🚄 **Speed**   : `{_sz(ema)}/s`  {tier}\n"
+        f"  ⏱ **ETA**     : `{_eta(eta_sec)}`\n"
+        f"  ⏳ **Elapsed** : `{_eta(elapsed)}`\n"
+        f"  ❌ /cancel to stop"
     )
     await _safe_edit(message, text)
 
@@ -143,18 +153,12 @@ async def upload_progress(current, total, message, start, uid=0):
 
 
 # ══════════════════════════════════════════════════════════════
-#  ASYNC FFMPEG  — non-blocking, bot never freezes
+#  ASYNC FFMPEG
 # ══════════════════════════════════════════════════════════════
 async def ffmpeg_cut(input: str, output: str, ss: float, t: float) -> bool:
-    """Run ffmpeg asynchronously. Returns True on success."""
     proc = await asyncio.create_subprocess_exec(
-        "ffmpeg", "-y",
-        "-ss",  str(ss),
-        "-i",   input,
-        "-t",   str(t),
-        "-c",   "copy",
-        "-avoid_negative_ts", "make_zero",
-        output,
+        "ffmpeg", "-y", "-ss", str(ss), "-i", input,
+        "-t", str(t), "-c", "copy", "-avoid_negative_ts", "make_zero", output,
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.DEVNULL,
     )
@@ -163,18 +167,12 @@ async def ffmpeg_cut(input: str, output: str, ss: float, t: float) -> bool:
 
 
 # ══════════════════════════════════════════════════════════════
-#  THUMBNAIL GENERATOR  — extract frame at midpoint of part
+#  THUMBNAIL GENERATOR
 # ══════════════════════════════════════════════════════════════
 async def make_thumb(video: str, ss: float, out: str) -> str | None:
-    """Extract one JPEG frame at timestamp `ss`. Returns path or None."""
     proc = await asyncio.create_subprocess_exec(
-        "ffmpeg", "-y",
-        "-ss",    str(ss),
-        "-i",     video,
-        "-vframes","1",
-        "-q:v",   "2",
-        "-vf",    "scale=320:-1",
-        out,
+        "ffmpeg", "-y", "-ss", str(ss), "-i", video,
+        "-vframes", "1", "-q:v", "2", "-vf", "scale=320:-1", out,
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.DEVNULL,
     )
@@ -183,34 +181,14 @@ async def make_thumb(video: str, ss: float, out: str) -> str | None:
 
 
 # ══════════════════════════════════════════════════════════════
-#  SPLIT PROGRESS BAR
-# ══════════════════════════════════════════════════════════════
-def _sbar(done: int, total: int, w: int = 16) -> str:
-    f = int(done / total * w)
-    return "⬛" * f + "⬜" * (w - f)
-
-async def _split_update(msg, done: int, total: int, note: str = "") -> None:
-    pct  = done * 100 // total
-    note_line = f"\n  ┗ _{note}_" if note else ""
-    await _safe_edit(
-        msg,
-        f"✂️ **Splitting…**\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{_sbar(done, total)} **{pct}%**\n"
-        f"  Part **{done}** / **{total}** done{note_line}"
-    )
-
-
-# ══════════════════════════════════════════════════════════════
 #  VIDEO DURATION
 # ══════════════════════════════════════════════════════════════
 async def get_duration(file: str) -> float | None:
     try:
         proc = await asyncio.create_subprocess_exec(
-            "ffprobe","-v","error",
-            "-show_entries","format=duration",
-            "-of","default=noprint_wrappers=1:nokey=1",
-            file,
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", file,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
         )
@@ -221,12 +199,36 @@ async def get_duration(file: str) -> float | None:
 
 
 # ══════════════════════════════════════════════════════════════
-#  UPLOAD ONE PART  (with thumb + flood-safe retry)
+#  SPLIT BAR
+# ══════════════════════════════════════════════════════════════
+def _sbar(done: int, total: int, w: int = 16) -> str:
+    f = int(done / total * w)
+    return "⬛" * f + "⬜" * (w - f)
+
+async def _split_update(msg, done: int, total: int, note: str = "") -> None:
+    pct = done * 100 // total
+    note_line = f"\n  ┗ _{note}_" if note else ""
+    await _safe_edit(
+        msg,
+        f"✂️ **Splitting…**\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{_sbar(done, total)} **{pct}%**\n"
+        f"  Part **{done}** / **{total}** done{note_line}\n"
+        f"  ❌ /cancel to stop"
+    )
+
+
+# ══════════════════════════════════════════════════════════════
+#  UPLOAD ONE PART
 # ══════════════════════════════════════════════════════════════
 async def _upload_part(
     message, path: str, num: int, total: int,
     uid: int, thumb_time: float
-) -> None:
+) -> bool:
+    """Returns False if cancelled."""
+    if _get_cancel(uid).is_set():
+        return False
+
     status = await message.reply(
         f"⠋ **⬆️ Upload**  — part {num}/{total}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -236,12 +238,13 @@ async def _upload_part(
     _reset(uid)
     t0 = time.time()
 
-    # Generate thumbnail at midpoint of this part
     thumb_path = f"{THUMB_DIR}/thumb_{uid}_{num}.jpg"
     thumb = await make_thumb(path, thumb_time, thumb_path)
 
-    # Upload with flood-safe retry
     for attempt in range(3):
+        if _get_cancel(uid).is_set():
+            await _safe_edit(status, "🚫 Upload cancelled.")
+            return False
         try:
             await message.reply_video(
                 path,
@@ -264,6 +267,7 @@ async def _upload_part(
         await status.delete()
     except Exception:
         pass
+    return True
 
 
 # ══════════════════════════════════════════════════════════════
@@ -272,111 +276,222 @@ async def _upload_part(
 @app.on_message(filters.command("start"))
 async def start(client, message):
     await message.reply(
-        "⚡ **ULTRA BOT v4** — ready!\n\n"
+        "⚡ **ULTRA BOT v5** — ready!\n\n"
         "📤 Send any **video**, then:\n"
         "  • `/split 3`     — N equal parts\n"
         "  • `/splitmin 2`  — chunk every N minutes\n\n"
+        "🛠 Commands:\n"
+        "  • `/status`  — see what's running\n"
+        "  • `/cancel`  — stop current task\n\n"
         "✨ Multi-user · Async ffmpeg · Auto thumbnails\n"
         "🔄 Flood retry · 0.2s progress · EMA speed"
     )
 
 
 # ══════════════════════════════════════════════════════════════
-#  RECEIVE VIDEO  — multi-user, handles MP4 + MKV + any video doc
+#  /status  — show current task info
+# ══════════════════════════════════════════════════════════════
+@app.on_message(filters.command("status"))
+async def status_cmd(client, message):
+    uid  = message.from_user.id
+    lock = _get_lock(uid)
+    info = user_status.get(uid)
+
+    if not lock.locked() or not info:
+        # Check if video is ready but no task running
+        if uid in user_files:
+            fname = os.path.basename(user_files[uid])
+            fsize = _sz(os.path.getsize(user_files[uid])) if os.path.exists(user_files[uid]) else "?"
+            return await message.reply(
+                f"💤 **Idle** — no task running\n\n"
+                f"📁 Video ready: `{fname}`\n"
+                f"📦 Size: `{fsize}`\n\n"
+                f"👉 Use `/split N` or `/splitmin N`"
+            )
+        return await message.reply(
+            "💤 **Idle** — no task running\n\n"
+            "📤 Send a video to get started."
+        )
+
+    elapsed = _eta(time.time() - info["since"])
+    await message.reply(
+        f"⚙️ **Task running…**\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"  📌 **Task**    : `{info['task']}`\n"
+        f"  📝 **Detail**  : `{info['detail']}`\n"
+        f"  ⏳ **Running** : `{elapsed}`\n\n"
+        f"  ❌ Use /cancel to stop"
+    )
+
+
+# ══════════════════════════════════════════════════════════════
+#  /cancel  — stop current task cleanly
+# ══════════════════════════════════════════════════════════════
+@app.on_message(filters.command("cancel"))
+async def cancel_cmd(client, message):
+    uid  = message.from_user.id
+    lock = _get_lock(uid)
+
+    if not lock.locked():
+        return await message.reply("💤 No task running to cancel.")
+
+    # Set the cancel event — task will stop at next checkpoint
+    _get_cancel(uid).set()
+    await message.reply(
+        "🚫 **Cancel requested!**\n\n"
+        "Task will stop at the next checkpoint.\n"
+        "Cleanup will happen automatically."
+    )
+
+
+# ══════════════════════════════════════════════════════════════
+#  RECEIVE VIDEO
 # ══════════════════════════════════════════════════════════════
 @app.on_message(filters.video | filters.document)
 async def receive(client, message):
     uid  = message.from_user.id
     lock = _get_lock(uid)
 
-    # ── Detect actual media object (video or document) ────────
     media = message.video or message.document
     if not media:
-        return await message.reply("❌ No file found. Send a video file.")
+        return
 
-    # ── Filter: only allow video mime types ───────────────────
-    mime = getattr(media, "mime_type", "") or ""
-    if not mime.startswith("video/"):
-        # also allow octet-stream for generic uploads
-        if mime not in ("application/octet-stream", ""):
-            return  # silently ignore non-video documents (images, pdfs etc)
+    mime      = getattr(media, "mime_type", "") or ""
+    file_size = getattr(media, "file_size", 0) or 0
+
+    VIDEO_MIMES = (
+        "video/mp4", "video/x-matroska", "video/mkv",
+        "video/avi", "video/x-msvideo", "video/webm",
+        "video/quicktime", "video/x-ms-wmv", "video/3gpp",
+        "application/octet-stream",
+    )
+    if mime and not any(mime.startswith(v) for v in VIDEO_MIMES):
+        return
 
     if lock.locked():
-        return await message.reply("⏳ Your previous task is still running.")
+        return await message.reply("⏳ Your previous task is still running.\n👉 /status to check · /cancel to stop")
 
-    # ── Detect extension from mime type ───────────────────────
     ext_map = {
-        "video/mp4":        "mp4",
-        "video/x-matroska": "mkv",
-        "video/mkv":        "mkv",
-        "video/avi":        "avi",
-        "video/x-msvideo":  "avi",
-        "video/webm":       "webm",
-        "video/quicktime":  "mov",
-        "video/x-ms-wmv":   "wmv",
+        "video/x-matroska": "mkv", "video/mkv": "mkv",
+        "video/avi": "avi",        "video/x-msvideo": "avi",
+        "video/webm": "webm",      "video/quicktime": "mov",
+        "video/x-ms-wmv": "wmv",   "video/3gpp": "3gp",
     }
-    ext = ext_map.get(mime, "mp4")
+    ext   = ext_map.get(mime, "mp4")
     fname = f"{DOWNLOAD_DIR}/video_{uid}_{message.id}.{ext}"
 
+    sz_str = _sz(file_size) if file_size else "unknown size"
     status = await message.reply(
-        f"⠋ **⬇️ Download**\n"
+        f"📥 **Downloading…**\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜\n"
-        f"  🌀 **0.0%**  ·  `{mime or 'video'}` detected…"
+        f"  🌀 **0%**  ·  {sz_str}"
     )
+
+    # Clear any leftover cancel flag
+    _get_cancel(uid).clear()
     _reset(uid)
+    _set_status(uid, "Downloading", sz_str)
     t0 = time.time()
 
-    path = await message.download(
-        file_name=fname,
-        progress=progress,
-        progress_args=(status, t0, uid, "⬇️ Download"),
-    )
+    try:
+        path = await message.download(
+            file_name=fname,
+            progress=progress,
+            progress_args=(status, t0, uid, "📥 Download"),
+        )
+    except Exception as e:
+        _clear_status(uid)
+        await _safe_edit(status, f"❌ Download failed: `{e}`")
+        return
+
+    if not path or not os.path.exists(path):
+        _clear_status(uid)
+        await _safe_edit(status, "❌ Download failed — file not saved.")
+        return
 
     _reset(uid)
+    _clear_status(uid)
     user_files[uid] = path
-    await _safe_edit(status, "✅ **Download complete!**\n\n👉 `/split N`  or  `/splitmin N`")
+    actual_size = _sz(os.path.getsize(path))
+    await _safe_edit(
+        status,
+        f"✅ **Download complete!**\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛\n"
+        f"  🏁 **100%**  ·  {actual_size} saved\n\n"
+        f"👉 `/split N`  or  `/splitmin N`"
+    )
 
 
 # ══════════════════════════════════════════════════════════════
-#  CORE SPLIT LOGIC  (shared by /split and /splitmin)
+#  CORE SPLIT LOGIC
 # ══════════════════════════════════════════════════════════════
 async def _do_split(message, uid: int, seg: float, parts: int, label: str) -> None:
-    file = user_files[uid]
-    msg  = await message.reply(
+    file   = user_files[uid]
+    cancel = _get_cancel(uid)
+    cancel.clear()  # reset cancel flag at start
+
+    msg = await message.reply(
         f"✂️ **{label}**\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ **0%**"
+        f"⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ **0%**\n"
+        f"  ❌ /cancel to stop"
     )
 
     try:
         for i in range(parts):
-            ss  = i * seg
+
+            # ── Cancel checkpoint ─────────────────────────────
+            if cancel.is_set():
+                await _safe_edit(msg,
+                    f"🚫 **Cancelled!**\n"
+                    f"  Stopped after **{i}** / **{parts}** parts.\n"
+                    f"  Partial files cleaned up."
+                )
+                _clear_status(uid)
+                return
+
+            ss = i * seg
+            _set_status(uid, "Splitting", f"part {i+1}/{parts}")
             await _split_update(msg, i, parts, f"cutting {i+1}/{parts}…")
 
-            out   = f"{DOWNLOAD_DIR}/part_{uid}_{i+1}.mp4"
-            ok    = await ffmpeg_cut(file, out, ss, seg)
+            out = f"{DOWNLOAD_DIR}/part_{uid}_{i+1}.mp4"
+            ok  = await ffmpeg_cut(file, out, ss, seg)
 
             if not ok or not os.path.exists(out):
                 await _safe_edit(msg, f"❌ ffmpeg failed on part {i+1}")
+                _clear_status(uid)
                 return
 
-            # Thumbnail at midpoint of this part
+            _set_status(uid, "Uploading", f"part {i+1}/{parts}")
             thumb_time = ss + seg / 2
-
-            await _upload_part(message, out, i+1, parts, uid, thumb_time)
+            uploaded = await _upload_part(message, out, i+1, parts, uid, thumb_time)
             os.remove(out)
 
+            if not uploaded:
+                # Was cancelled during upload
+                await _safe_edit(msg,
+                    f"🚫 **Cancelled!**\n"
+                    f"  Stopped after **{i+1}** / **{parts}** parts."
+                )
+                _clear_status(uid)
+                return
+
+        # ── All done ──────────────────────────────────────────
         os.remove(file)
         user_files.pop(uid, None)
+        _clear_status(uid)
         await _safe_edit(
             msg,
             f"🏁 **All {parts} parts done!**\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛ **100%**\n  ✅ Complete"
+            f"⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛ **100%**\n"
+            f"  ✅ Complete"
         )
 
     except Exception as e:
+        _clear_status(uid)
         await _safe_edit(msg, f"❌ Error: `{e}`")
 
 
@@ -389,7 +504,7 @@ async def split(client, message):
     lock = _get_lock(uid)
 
     if lock.locked():
-        return await message.reply("⏳ Already processing.")
+        return await message.reply("⏳ Already processing.\n👉 /status to check · /cancel to stop")
     if uid not in user_files:
         return await message.reply("❌ Send a video first.")
 
@@ -416,7 +531,7 @@ async def splitmin(client, message):
     lock = _get_lock(uid)
 
     if lock.locked():
-        return await message.reply("⏳ Already processing.")
+        return await message.reply("⏳ Already processing.\n👉 /status to check · /cancel to stop")
     if uid not in user_files:
         return await message.reply("❌ Send a video first.")
 
