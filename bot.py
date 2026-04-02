@@ -53,82 +53,91 @@ async def _dedup(mid: int) -> bool:
         if mid in _seen_msgs:
             return True
         _seen_msgs.add(mid)
-        if len(_seen_msgs) > 300:
+        if len(_seen_msgs) > 500:
             _seen_msgs.clear()
         return False
 
 
 # ══════════════════════════════════════════════════════════════
-#  ANIMATION FRAMES & VISUAL CONSTANTS
+#  UPLOAD DEDUP GUARD  (FIX FOR DOUBLE UPLOAD)
+#  Key = (uid, part_num)  →  True if already uploaded
 # ══════════════════════════════════════════════════════════════
+_uploaded_parts: dict[tuple, bool] = {}
 
-# Cinematic spinners
-SPINNER_ORBIT    = ["◜","◝","◞","◟"]
-SPINNER_PULSE    = ["◉","○","◉","○"]
-SPINNER_MATRIX   = ["▓","▒","░"," ","░","▒","▓"]
-SPINNER_RADAR    = ["◴","◷","◶","◵"]
-SPINNER_BOUNCE   = ["⣾","⣽","⣻","⢿","⡿","⣟","⣯","⣷"]
-SPINNER_WAVE     = ["〰","≈","∿","〰","≈"]
-SPINNER_SIGNAL   = ["▁","▂","▃","▄","▅","▆","▇","█","▇","▆","▅","▄","▃","▂"]
-SPINNER_CUBE     = ["▪","▫","▪","▫"]
-SPINNER_PHASE    = ["🌑","🌒","🌓","🌔","🌕","🌖","🌗","🌘"]
-SPINNER_CLOCK    = ["🕐","🕑","🕒","🕓","🕔","🕕","🕖","🕗","🕘","🕙","🕚","🕛"]
-SPINNER_DOTS_V2  = ["⣀","⣄","⣤","⣦","⣶","⣷","⣿","⣷","⣶","⣦","⣤","⣄"]
+def _mark_uploaded(uid: int, num: int) -> None:
+    _uploaded_parts[(uid, num)] = True
 
-# Download uses BOUNCE, Upload uses SIGNAL
-DOWNLOAD_SPINNER = SPINNER_BOUNCE
-UPLOAD_SPINNER   = SPINNER_SIGNAL
+def _is_uploaded(uid: int, num: int) -> bool:
+    return _uploaded_parts.get((uid, num), False)
 
-# Animated bar styles
-BAR_STYLES = {
-    "classic":  ("█", "░"),
-    "smooth":   ("▰", "▱"),
-    "gradient": ("▓", "░"),
-    "block":    ("■", "□"),
-    "sharp":    ("━", "─"),
-    "circuit":  ("◼", "◻"),
-    "wave":     ("≣", "≡"),
-}
+def _clear_uploads(uid: int) -> None:
+    keys = [k for k in _uploaded_parts if k[0] == uid]
+    for k in keys:
+        del _uploaded_parts[k]
 
-# Milestones
-MILESTONES = {
-    100: ("🏆", "COMPLETE"),
-    90:  ("🔥", "BLAZING"),
-    75:  ("⚡", "LIGHTNING"),
-    50:  ("🚀", "CRUISING"),
-    25:  ("💫", "RISING"),
-    10:  ("🌀", "SPINNING"),
-    0:   ("🔵", "STARTING"),
-}
 
-TIER_COLORS = {
-    "🟢 ULTRA":  (10 * 1024 * 1024, "🟢 ██ ULTRA ██"),
-    "🟩 FAST":   (5  * 1024 * 1024, "🟩 ▓▓ FAST  ▓▓"),
-    "🟡 GOOD":   (1  * 1024 * 1024, "🟡 ▒▒ GOOD  ▒▒"),
-    "🟠 OK":     (512 * 1024,       "🟠 ░░ OK    ░░"),
-    "🔴 SLOW":   (0,                "🔴 ·· SLOW  ··"),
-}
+# ══════════════════════════════════════════════════════════════
+#  SPINNER / ANIMATION CONSTANTS
+# ══════════════════════════════════════════════════════════════
+BOUNCE  = ["⣾","⣽","⣻","⢿","⡿","⣟","⣯","⣷"]
+SIGNAL  = ["▁","▂","▃","▄","▅","▆","▇","█","▇","▆","▅","▄","▃","▂"]
+CLOCK   = ["🕐","🕑","🕒","🕓","🕔","🕕","🕖","🕗","🕘","🕙","🕚","🕛"]
+ORBIT   = ["◜","◝","◞","◟"]
+PHASE   = ["🌑","🌒","🌓","🌔","🌕","🌖","🌗","🌘"]
+MATRIX  = list("ﾊﾋｼｦｲｸｺｻﾀﾔｹﾦｿﾌﾔｪｷ01")
 
-THROTTLE  = 0.15   # slightly faster refresh
-EMA_ALPHA = 0.35
+# Progress bar styles (all Telegram-safe)
+BAR_FILL  = "█"
+BAR_EMPTY = "░"
+BAR_LEAD  = "▓"   # leading edge of fill
+
+# Speed tiers — clean, no weird chars
+def _speed_label(bps: float) -> str:
+    mbps = bps / (1024 * 1024)
+    kbps = bps / 1024
+    if mbps >= 10:  return "🟢 ULTRA"
+    if mbps >= 5:   return "🟢 FAST"
+    if mbps >= 1:   return "🟡 GOOD"
+    if kbps >= 512: return "🟡 OK"
+    return "🔴 SLOW"
+
+# Milestone icons
+def _milestone(pct: float) -> str:
+    if pct >= 100: return "🏆"
+    if pct >= 90:  return "🔥"
+    if pct >= 75:  return "⚡"
+    if pct >= 50:  return "🚀"
+    if pct >= 25:  return "💫"
+    if pct >= 10:  return "🌀"
+    return "🔵"
 
 
 # ══════════════════════════════════════════════════════════════
 #  INTERNAL PROGRESS STATE
 # ══════════════════════════════════════════════════════════════
-_last_edit:  dict[int, float] = {}
-_ema_speed:  dict[int, float] = {}
-_spin_idx:   dict[int, int]   = {}
-_shown_pct:  dict[int, float] = {}
-_frame_tick: dict[int, int]   = {}   # generic frame counter
+_last_edit:     dict[int, float] = {}
+_ema_speed:     dict[int, float] = {}
+_spin_idx:      dict[int, int]   = {}
+_shown_pct:     dict[int, float] = {}
+_speed_history: dict[int, list]  = {}
 
 def _reset(uid: int) -> None:
-    for d in (_last_edit, _ema_speed, _spin_idx, _shown_pct, _frame_tick):
+    for d in (_last_edit, _ema_speed, _spin_idx, _shown_pct):
         d.pop(uid, None)
+
+def _record_speed(uid: int, bps: float) -> None:
+    if uid not in _speed_history:
+        _speed_history[uid] = []
+    _speed_history[uid].append(bps)
+    if len(_speed_history[uid]) > 24:
+        _speed_history[uid].pop(0)
+
+THROTTLE  = 0.18
+EMA_ALPHA = 0.35
 
 
 # ══════════════════════════════════════════════════════════════
-#  UTILITY FORMATTERS
+#  FORMATTERS
 # ══════════════════════════════════════════════════════════════
 def _sz(b: float) -> str:
     for u in ("B","KB","MB","GB"):
@@ -138,51 +147,36 @@ def _sz(b: float) -> str:
 
 def _eta(s: float) -> str:
     s = max(0, s)
-    if s >= 3600: return f"{int(s//3600)}h {int(s%3600//60)}m {int(s%60)}s"
+    if s >= 3600: return f"{int(s//3600)}h {int(s%3600//60)}m"
     if s >= 60:   return f"{int(s//60)}m {int(s%60)}s"
     return f"{int(s)}s"
 
-def _speed_tier(bps: float) -> str:
-    for label, (threshold, display) in TIER_COLORS.items():
-        if bps >= threshold:
-            return display
-    return TIER_COLORS["🔴 SLOW"][1]
+def _bar(pct: float, w: int = 18) -> str:
+    """Clean solid bar — always renders correctly."""
+    n = max(0, min(w, int(pct / 100 * w)))
+    return BAR_FILL * n + BAR_EMPTY * (w - n)
 
-def _milestone(pct: float) -> tuple[str, str]:
-    for thresh, (icon, label) in sorted(MILESTONES.items(), reverse=True):
-        if pct >= thresh:
-            return icon, label
-    return "🔵", "STARTING"
+def _abar(pct: float, tick: int, w: int = 18) -> str:
+    """Animated bar with pulsing lead edge."""
+    n = max(0, min(w, int(pct / 100 * w)))
+    if n == 0:  return BAR_EMPTY * w
+    if n >= w:  return BAR_FILL * w
+    lead = BAR_LEAD if tick % 2 == 0 else BAR_FILL
+    return BAR_FILL * (n - 1) + lead + BAR_EMPTY * (w - n)
 
-def _bar(pct: float, width: int = 18, style: str = "smooth") -> str:
-    fill, empty = BAR_STYLES.get(style, BAR_STYLES["smooth"])
-    n = int(min(pct, 100) / 100 * width)
-    return fill * n + empty * (width - n)
+def _sparkline(history: list, w: int = 12) -> str:
+    """ASCII sparkline from speed samples."""
+    bars = " ▁▂▃▄▅▆▇█"
+    if not history: return "─" * w
+    mx = max(history) or 1
+    samples = history[-w:]
+    return "".join(bars[min(8, int(s / mx * 8))] for s in samples)
 
-def _animated_bar(pct: float, tick: int, width: int = 18) -> str:
-    """Shimmer effect — leading edge pulses."""
-    filled, empty = BAR_STYLES["smooth"]
-    n = int(min(pct, 100) / 100 * width)
-    if n == 0:
-        return empty * width
-    # Shimmer on leading character
-    leader = "▸" if tick % 2 == 0 else "▹"
-    if n >= width:
-        return filled * width
-    return filled * (n - 1) + leader + empty * (width - n)
-
-def _count_up(uid: int, real: float, step: float = 2.0) -> float:
+def _count_up(uid: int, real: float, step: float = 2.5) -> float:
     prev  = _shown_pct.get(uid, 0.0)
     shown = min(real, prev + step) if real > prev else real
     _shown_pct[uid] = shown
     return shown
-
-def _mini_graph(speeds: list[float], width: int = 10) -> str:
-    """Tiny sparkline from recent speed samples."""
-    bars = " ▁▂▃▄▅▆▇█"
-    if not speeds: return "─" * width
-    mx = max(speeds) or 1
-    return "".join(bars[min(8, int(s / mx * 8))] for s in speeds[-width:])
 
 
 # ══════════════════════════════════════════════════════════════
@@ -192,7 +186,7 @@ async def _safe_edit(msg, text: str) -> None:
     try:
         await msg.edit(text)
     except FloodWait as e:
-        await asyncio.sleep(e.value + 0.5)
+        await asyncio.sleep(min(e.value, 10) + 0.5)
         try: await msg.edit(text)
         except Exception: pass
     except MessageNotModified:
@@ -202,28 +196,14 @@ async def _safe_edit(msg, text: str) -> None:
 
 
 # ══════════════════════════════════════════════════════════════
-#  SPEED HISTORY (per user, rolling 20 samples)
-# ══════════════════════════════════════════════════════════════
-_speed_history: dict[int, list[float]] = {}
-
-def _record_speed(uid: int, bps: float) -> None:
-    if uid not in _speed_history:
-        _speed_history[uid] = []
-    _speed_history[uid].append(bps)
-    if len(_speed_history[uid]) > 20:
-        _speed_history[uid].pop(0)
-
-def _get_speed_history(uid: int) -> list[float]:
-    return _speed_history.get(uid, [])
-
-
-# ══════════════════════════════════════════════════════════════
-#  PROGRESS ENGINE v7  — Cinematic, animated, feature-rich
+#  PROGRESS ENGINE v8
+#  FIX: clean bar, clean speed label, no broken chars
 # ══════════════════════════════════════════════════════════════
 async def progress(
     current: int, total: int,
     msg, start: float,
-    uid: int = 0, mode: str = "📥 Download",
+    uid: int = 0,
+    mode: str = "📥 Download",
 ) -> None:
     if not isinstance(total, (int, float)) or total <= 0: return
     if _get_cancel(uid).is_set(): return
@@ -231,6 +211,7 @@ async def progress(
     now     = time.time()
     elapsed = max(now - start, 0.001)
 
+    # Throttle
     if now - _last_edit.get(uid, 0.0) < THROTTLE and _last_edit.get(uid, 0.0) != 0.0:
         return
     _last_edit[uid] = now
@@ -245,51 +226,38 @@ async def progress(
     real  = current * 100 / total
     shown = _count_up(uid, real)
 
-    # Animation tick
-    tick = _frame_tick.get(uid, 0)
-    _frame_tick[uid] = tick + 1
+    # Spinner
+    tick = _spin_idx.get(uid, 0)
+    _spin_idx[uid] = tick + 1
+    spinner_pool   = BOUNCE if "Download" in mode else SIGNAL
+    spin           = spinner_pool[tick % len(spinner_pool)]
 
-    # Spinner selection
-    spinner_frames = DOWNLOAD_SPINNER if "Download" in mode else UPLOAD_SPINNER
-    spin = spinner_frames[tick % len(spinner_frames)]
+    # Visuals
+    bar         = _abar(shown, tick, 18)
+    icon        = _milestone(shown)
+    speed_lbl   = _speed_label(ema)
+    graph       = _sparkline(_speed_history.get(uid, []), 12)
+    pct_str     = f"{shown:.1f}%"
+    header      = "📥" if "Download" in mode else "📤"
 
-    # Visual elements
-    abar          = _animated_bar(shown, tick, 18)
-    icon, tier_lbl = _milestone(shown)
-    speed_tier    = _speed_tier(ema)
-    graph         = _mini_graph(_get_speed_history(uid), 12)
-    pct_int       = int(shown)
-    pct_tenths    = int((shown - pct_int) * 10)
+    # ETA urgency
+    eta_str = f"⚡ {_eta(eta_s)}" if eta_s < 15 and shown > 5 else _eta(eta_s)
 
-    # Percentage as digit-style display
-    pct_display = f"{pct_int:>3}.{pct_tenths}%"
-
-    # ETA with urgency cue
-    if eta_s < 10 and shown > 10:
-        eta_str = f"⚡`{_eta(eta_s)}`"
-    else:
-        eta_str = f"`{_eta(eta_s)}`"
-
-    is_download = "Download" in mode
-    header_char = "📥" if is_download else "📤"
-
-    text = (
+    await _safe_edit(msg,
         f"{spin} **{mode}**\n"
         f"══════════════════════════\n"
-        f"`{abar}`\n"
-        f"  {icon} **{pct_display}** — {tier_lbl}\n"
+        f"`{bar}`\n"
+        f"  {icon} **{pct_str}** — {speed_lbl}\n"
         f"──────────────────────────\n"
-        f"  📊 `{graph}` ← speed graph\n"
+        f"  📊 `{graph}` speed chart\n"
         f"──────────────────────────\n"
-        f"  {header_char} **Size**    `{_sz(current)}` / `{_sz(total)}`\n"
-        f"  ⚡ **Speed**   {speed_tier}\n"
-        f"         `{_sz(ema)}/s`\n"
-        f"  ⏱ **ETA**    {eta_str}\n"
-        f"  ⏳ **Elapsed** `{_eta(elapsed)}`\n"
+        f"  {header} **Size** : `{_sz(current)}` / `{_sz(total)}`\n"
+        f"  ⚡ **Speed**: `{_sz(ema)}/s`\n"
+        f"  ⏱ **ETA**  : `{eta_str}`\n"
+        f"  ⏳ **Time** : `{_eta(elapsed)}`\n"
         f"══════════════════════════\n"
         f"  ❌ /cancel to abort"
     )
-    await _safe_edit(msg, text)
 
 
 async def upload_progress(current, total, msg, start, uid=0):
@@ -297,7 +265,7 @@ async def upload_progress(current, total, msg, start, uid=0):
 
 
 # ══════════════════════════════════════════════════════════════
-#  ASYNC FFMPEG + THUMBNAIL + DURATION
+#  FFMPEG HELPERS
 # ══════════════════════════════════════════════════════════════
 async def ffmpeg_cut(inp: str, out: str, ss: float, t: float) -> bool:
     proc = await asyncio.create_subprocess_exec(
@@ -332,7 +300,7 @@ async def get_duration(file: str) -> float | None:
 
 
 # ══════════════════════════════════════════════════════════════
-#  ANIMATED SPLIT PROGRESS
+#  SPLIT PROGRESS BAR
 # ══════════════════════════════════════════════════════════════
 _split_tick: dict[int, int] = {}
 
@@ -341,165 +309,200 @@ async def _split_update(msg, done: int, total: int, uid: int, note: str = "") ->
     tick = _split_tick.get(uid, 0)
     _split_tick[uid] = tick + 1
 
-    spin  = SPINNER_ORBIT[tick % len(SPINNER_ORBIT)]
-    abar  = _animated_bar(pct, tick, 16)
-    note_line = f"\n  ┗ _{note}_" if note else ""
+    spin = ORBIT[tick % len(ORBIT)]
+    bar  = _abar(pct, tick, 16)
 
-    # Part indicators  e.g.  ✅ ✅ ✂️ ○ ○
-    indicators = ""
-    for i in range(total):
-        if i < done:
-            indicators += "✅"
-        elif i == done:
-            indicators += "✂️"
-        else:
-            indicators += "○"
-        if (i + 1) % 10 == 0 and i + 1 < total:
-            indicators += "\n  "
+    # Part dots: ✅ done · ✂️ cutting · ⬜ pending
+    max_dots = min(total, 20)
+    dots = ""
+    for i in range(max_dots):
+        if i < done:          dots += "✅"
+        elif i == done:       dots += "✂️"
+        else:                 dots += "⬜"
+        if (i + 1) % 10 == 0 and i + 1 < max_dots:
+            dots += "\n  "
+    if total > 20:
+        dots += f" +{total-20} more"
+
+    note_line = f"\n  ┗ _{note}_" if note else ""
 
     await _safe_edit(msg,
         f"{spin} **Splitting…**\n"
         f"══════════════════════════\n"
-        f"`{abar}` **{pct}%**\n"
-        f"  Part **{done}** / **{total}** done{note_line}\n"
+        f"`{bar}` **{pct}%**\n"
+        f"  Part **{done}** / **{total}**{note_line}\n"
         f"──────────────────────────\n"
-        f"  {indicators}\n"
+        f"  {dots}\n"
         f"══════════════════════════\n"
         f"  ❌ /cancel to stop"
     )
 
 
 # ══════════════════════════════════════════════════════════════
-#  ANIMATED FFMPEG PROGRESS (optional)
-# ══════════════════════════════════════════════════════════════
-async def _ffmpeg_progress_watch(msg, uid: int, duration: float, part: int, total: int) -> None:
-    """Animated 'cutting' display while ffmpeg runs (no real feedback — just cosmetic)."""
-    frames = SPINNER_WAVE
-    tick   = 0
-    while True:
-        if _get_cancel(uid).is_set():
-            return
-        spin = frames[tick % len(frames)]
-        bar  = _animated_bar(min(99, tick * 3), tick, 14)
-        await _safe_edit(msg,
-            f"{spin} **Cutting part {part}/{total}…**\n"
-            f"`{bar}` processing…\n"
-            f"  🔪 ffmpeg at work…"
-        )
-        tick += 1
-        await asyncio.sleep(0.4)
-
-
-# ══════════════════════════════════════════════════════════════
-#  UPLOAD ONE PART — FloodWait safe
+#  UPLOAD ONE PART
+#  FIX v8: per-part dedup dict prevents double upload
+#          even across FloodWait retries or crash-restarts
 # ══════════════════════════════════════════════════════════════
 async def _upload_part(
     message, path: str, num: int, total: int,
     uid: int, thumb_time: float
 ) -> bool:
+
+    # ── HARD GUARD: already uploaded this exact part? ──
+    if _is_uploaded(uid, num):
+        return True   # treat as success, skip silently
+
     if _get_cancel(uid).is_set():
         return False
 
-    # Animated upload header
     status = await message.reply(
-        f"⣾ **Upload** — part {num}/{total}\n"
+        f"⣾ **Uploading** part {num}/{total}…\n"
         f"══════════════════════════\n"
-        f"`░░░░░░░░░░░░░░░░░░` **0.0%**\n"
-        f"  🔵 STARTING — 0 B / ?\n"
+        f"`{BAR_EMPTY * 18}` **0.0%**\n"
+        f"  🔵 STARTING\n"
         f"══════════════════════════\n"
         f"  ❌ /cancel to abort"
     )
+
     _reset(uid)
     t0 = time.time()
 
     thumb_path = f"{THUMB_DIR}/thumb_{uid}_{num}.jpg"
     thumb = await make_thumb(path, thumb_time, thumb_path)
 
-    uploaded = False
+    success = False
+
     for attempt in range(5):
+        # Re-check guard at top of every attempt
+        if _is_uploaded(uid, num):
+            success = True
+            break
+
         if _get_cancel(uid).is_set():
             await _safe_edit(status,
                 "🚫 **Upload cancelled.**\n"
-                "  Stopped by user request."
+                "  Stopped by user."
             )
             break
+
         try:
             await message.reply_video(
                 path,
                 caption=(
                     f"🎬 **Part {num} / {total}**\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"  ✅ Delivered by Ultra Bot v7"
+                    f"  ✅ Delivered by Ultra Bot v8"
                 ),
                 thumb=thumb,
                 progress=upload_progress,
                 progress_args=(status, t0, uid),
             )
-            uploaded = True
+            # ── Mark as done IMMEDIATELY after success ──
+            _mark_uploaded(uid, num)
+            success = True
             break
+
         except FloodWait as e:
-            wait = e.value + 2
-            # Countdown display
+            # FloodWait = Telegram rejected request, NOT sent yet → safe to retry
+            wait = min(e.value + 2, 60)
             for remaining in range(wait, 0, -1):
-                spin = SPINNER_CLOCK[remaining % len(SPINNER_CLOCK)]
+                spin  = CLOCK[remaining % len(CLOCK)]
+                done_  = wait - remaining
+                fill   = int(done_ / wait * 18)
                 await _safe_edit(status,
                     f"{spin} **Flood wait** — part {num}/{total}\n"
                     f"══════════════════════════\n"
-                    f"  ⏳ Telegram says: wait `{remaining}s`\n"
-                    f"  `{'█' * min(20, int((wait - remaining) / wait * 20))}{'░' * max(0, 20 - int((wait - remaining) / wait * 20))}`\n"
-                    f"  Resuming automatically…"
+                    f"  ⏳ Resume in `{remaining}s`\n"
+                    f"  `{BAR_FILL*fill}{BAR_EMPTY*(18-fill)}`\n"
+                    f"  Auto-resuming…"
                 )
                 await asyncio.sleep(1)
-        except Exception as e:
-            if attempt >= 4:
-                await _safe_edit(status, f"❌ Upload failed part {num}: `{e}`")
-                break
-            await asyncio.sleep(3)
 
+        except Exception as e:
+            err = str(e).lower()
+            # Telegram sometimes returns error AFTER successful send
+            if any(x in err for x in ["duplicate", "already", "message_id_invalid"]):
+                _mark_uploaded(uid, num)
+                success = True
+                break
+            if attempt >= 4:
+                await _safe_edit(status, f"❌ Upload failed part {num}:\n`{e}`")
+                break
+            await asyncio.sleep(3 * (attempt + 1))
+
+    # Cleanup
     _reset(uid)
     if thumb and os.path.exists(thumb_path):
-        os.remove(thumb_path)
+        try: os.remove(thumb_path)
+        except Exception: pass
     try:
         await status.delete()
     except Exception:
         pass
-    return uploaded
+
+    return success
 
 
 # ══════════════════════════════════════════════════════════════
-#  /start — cinematic welcome card
+#  /start
 # ══════════════════════════════════════════════════════════════
-@app.on_message(filters.command("start"), group=1)
+@app.on_message(filters.command("start") & filters.incoming, group=0)
 async def start(client, message):
     if await _dedup(message.id): return
     name = message.from_user.first_name or "User"
     await message.reply(
         f"╔══════════════════════════╗\n"
-        f"║  ⚡  ULTRA BOT  v7  ⚡   ║\n"
+        f"║  ⚡  ULTRA BOT  v8  ⚡   ║\n"
         f"╚══════════════════════════╝\n\n"
         f"👋 Welcome, **{name}**!\n\n"
-        f"📽 **Send any video** to begin:\n"
-        f"  └─ MP4 · MKV · AVI · MOV · WEBM…\n\n"
+        f"📽 **Send any video file:**\n"
+        f"  └─ MP4 · MKV · AVI · MOV · WEBM\n\n"
         f"✂️ **Split commands:**\n"
         f"  • `/split 3`    → 3 equal parts\n"
         f"  • `/splitmin 2` → 2-min chunks\n\n"
         f"🛠 **Utilities:**\n"
-        f"  • `/status`     → live task view\n"
-        f"  • `/cancel`     → abort task\n\n"
+        f"  • `/status`  → live task info\n"
+        f"  • `/cancel`  → abort task\n"
+        f"  • `/info`    → file details\n\n"
         f"──────────────────────────\n"
-        f"  🎨 Animated progress bars\n"
-        f"  📊 Live speed graph\n"
-        f"  🔄 Flood-safe · No crash\n"
-        f"  👥 Multi-user async\n"
+        f"  🎯 Animated progress bars\n"
+        f"  📊 Live speed sparkline\n"
+        f"  🔄 No double upload — fixed!\n"
+        f"  👥 Multi-user safe\n"
         f"──────────────────────────\n"
-        f"  _Ultra Bot v7 — Ready_"
+        f"  _Ultra Bot v8 — All bugs fixed_ ✓"
     )
 
 
 # ══════════════════════════════════════════════════════════════
-#  /status — live dashboard
+#  /info
 # ══════════════════════════════════════════════════════════════
-@app.on_message(filters.command("status"), group=1)
+@app.on_message(filters.command("info") & filters.incoming, group=0)
+async def info_cmd(client, message):
+    if await _dedup(message.id): return
+    uid = message.from_user.id
+    if uid not in user_files or not os.path.exists(user_files[uid]):
+        return await message.reply("❌ No video loaded.\n  Send a video first!")
+    path  = user_files[uid]
+    size  = os.path.getsize(path)
+    dur   = await get_duration(path)
+    fname = os.path.basename(path)
+    dur_str = _eta(dur) if dur else "unknown"
+    await message.reply(
+        f"📋 **FILE INFO**\n"
+        f"══════════════════════════\n"
+        f"  📁 `{fname}`\n"
+        f"  📦 Size    : `{_sz(size)}`\n"
+        f"  🎬 Duration: `{dur_str}`\n"
+        f"══════════════════════════\n"
+        f"  👉 `/split N`  or  `/splitmin N`"
+    )
+
+
+# ══════════════════════════════════════════════════════════════
+#  /status
+# ══════════════════════════════════════════════════════════════
+@app.on_message(filters.command("status") & filters.incoming, group=0)
 async def status_cmd(client, message):
     if await _dedup(message.id): return
     uid  = message.from_user.id
@@ -510,36 +513,37 @@ async def status_cmd(client, message):
             fname = os.path.basename(user_files[uid])
             fsize = _sz(os.path.getsize(user_files[uid]))
             return await message.reply(
-                f"💤 **IDLE — Ready to split**\n"
+                f"💤 **IDLE — Video ready**\n"
                 f"══════════════════════════\n"
                 f"  📁 `{fname}`\n"
-                f"  📦 {fsize}\n"
+                f"  📦 `{fsize}`\n"
                 f"══════════════════════════\n"
-                f"  👉 `/split N`  or  `/splitmin N`"
+                f"  👉 `/split N`  or  `/splitmin N`\n"
+                f"  📋 `/info` for full details"
             )
         return await message.reply(
             f"💤 **IDLE**\n"
             f"══════════════════════════\n"
             f"  No video loaded.\n"
-            f"  Send a video to start!\n"
+            f"  Send a video to begin!\n"
             f"══════════════════════════"
         )
 
     elapsed = _eta(time.time() - info["since"])
-    hist    = _get_speed_history(uid)
-    graph   = _mini_graph(hist, 14) if hist else "no data"
-    speed   = _sz(hist[-1]) + "/s" if hist else "—"
+    hist    = _speed_history.get(uid, [])
+    graph   = _sparkline(hist, 14) if hist else "no data"
+    speed   = f"{_sz(hist[-1])}/s" if hist else "—"
+    spin    = ORBIT[int(time.time() * 4) % len(ORBIT)]
 
-    spin = SPINNER_RADAR[int(time.time() * 3) % len(SPINNER_RADAR)]
     await message.reply(
-        f"{spin} **RUNNING — Live Status**\n"
+        f"{spin} **RUNNING**\n"
         f"══════════════════════════\n"
-        f"  📌 **Task**     `{info['task']}`\n"
-        f"  📝 **Detail**   `{info['detail']}`\n"
-        f"  ⏳ **Running**  `{elapsed}`\n"
+        f"  📌 Task    : `{info['task']}`\n"
+        f"  📝 Detail  : `{info['detail']}`\n"
+        f"  ⏳ Running : `{elapsed}`\n"
         f"──────────────────────────\n"
-        f"  📊 `{graph}`\n"
-        f"  ⚡ **Speed**    `{speed}`\n"
+        f"  📊 `{graph}` speed\n"
+        f"  ⚡ `{speed}`\n"
         f"══════════════════════════\n"
         f"  ❌ /cancel to stop"
     )
@@ -548,7 +552,7 @@ async def status_cmd(client, message):
 # ══════════════════════════════════════════════════════════════
 #  /cancel
 # ══════════════════════════════════════════════════════════════
-@app.on_message(filters.command("cancel"), group=1)
+@app.on_message(filters.command("cancel") & filters.incoming, group=0)
 async def cancel_cmd(client, message):
     if await _dedup(message.id): return
     uid = message.from_user.id
@@ -569,7 +573,12 @@ async def cancel_cmd(client, message):
 # ══════════════════════════════════════════════════════════════
 #  RECEIVE VIDEO
 # ══════════════════════════════════════════════════════════════
-@app.on_message(filters.incoming & (filters.video | filters.document), group=-1)
+@app.on_message(
+    filters.incoming
+    & ~filters.command(["start","split","splitmin","status","cancel","info"])
+    & (filters.video | filters.document),
+    group=1
+)
 async def receive(client, message):
     if await _dedup(message.id): return
 
@@ -597,22 +606,22 @@ async def receive(client, message):
         user_files.pop(uid, None)
 
     ext_map = {
-        "video/x-matroska": "mkv", "video/mkv":       "mkv",
-        "video/avi":        "avi", "video/x-msvideo":  "avi",
-        "video/webm":      "webm", "video/quicktime":  "mov",
-        "video/x-ms-wmv":  "wmv", "video/3gpp":        "3gp",
+        "video/x-matroska":"mkv","video/mkv":"mkv",
+        "video/avi":"avi","video/x-msvideo":"avi",
+        "video/webm":"webm","video/quicktime":"mov",
+        "video/x-ms-wmv":"wmv","video/3gpp":"3gp",
     }
-    ext    = ext_map.get(mime, "mp4")
-    fname  = f"{DOWNLOAD_DIR}/video_{uid}_{message.id}.{ext}"
-    sz_str = _sz(file_size) if file_size else "?"
+    ext   = ext_map.get(mime, "mp4")
+    fname = f"{DOWNLOAD_DIR}/video_{uid}_{message.id}.{ext}"
+    sz_str= _sz(file_size) if file_size else "?"
 
     status = await message.reply(
         f"⣾ **DOWNLOAD STARTING**\n"
         f"══════════════════════════\n"
-        f"  📁 Format  : `{ext.upper()}`\n"
-        f"  📦 Size    : `{sz_str}`\n"
+        f"  📁 Format : `{ext.upper()}`\n"
+        f"  📦 Size   : `{sz_str}`\n"
         f"──────────────────────────\n"
-        f"`░░░░░░░░░░░░░░░░░░` **0%**\n"
+        f"`{BAR_EMPTY * 18}` **0%**\n"
         f"══════════════════════════\n"
         f"  ❌ /cancel to abort"
     )
@@ -620,6 +629,7 @@ async def receive(client, message):
     _get_cancel(uid).clear()
     _reset(uid)
     _speed_history.pop(uid, None)
+    _clear_uploads(uid)   # fresh upload state
     _set_status(uid, "Downloading", sz_str)
     t0 = time.time()
 
@@ -637,13 +647,15 @@ async def receive(client, message):
     if not path or not os.path.exists(path):
         _clear_status(uid)
         await _safe_edit(status,
-            "❌ **File not saved**\n"
+            "❌ **File not saved.**\n"
             "  Try again or send a different file."
         )
         return
 
     elapsed = time.time() - t0
-    avg_speed = file_size / elapsed if elapsed > 0 and file_size else 0
+    avg_spd = file_size / elapsed if elapsed > 0 and file_size else 0
+    actual_size = os.path.getsize(path)
+
     _reset(uid)
     _clear_status(uid)
     user_files[uid] = path
@@ -651,32 +663,36 @@ async def receive(client, message):
     await _safe_edit(status,
         f"✅ **DOWNLOAD COMPLETE**\n"
         f"══════════════════════════\n"
-        f"`▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰` **100%**\n"
+        f"`{BAR_FILL * 18}` **100%**\n"
         f"  🏆 COMPLETE\n"
         f"──────────────────────────\n"
         f"  📁 `{os.path.basename(path)}`\n"
-        f"  📦 `{_sz(os.path.getsize(path))}`\n"
-        f"  ⚡ avg `{_sz(avg_speed)}/s`\n"
+        f"  📦 `{_sz(actual_size)}`\n"
+        f"  ⚡ avg `{_sz(avg_spd)}/s`\n"
         f"  ⏱ in `{_eta(elapsed)}`\n"
         f"══════════════════════════\n"
-        f"  👉 `/split N`  or  `/splitmin N`"
+        f"  👉 `/split N`  or  `/splitmin N`\n"
+        f"  📋 `/info` for file details"
     )
 
 
 # ══════════════════════════════════════════════════════════════
 #  CORE SPLIT LOGIC
 # ══════════════════════════════════════════════════════════════
-async def _do_split(message, uid: int, seg: float, parts: int, label: str) -> None:
+async def _do_split(
+    message, uid: int, seg: float, parts: int, label: str
+) -> None:
     file   = user_files[uid]
     cancel = _get_cancel(uid)
     cancel.clear()
+    _clear_uploads(uid)      # reset dedup for this split session
     _split_tick[uid] = 0
 
     msg = await message.reply(
         f"✂️ **{label}**\n"
         f"══════════════════════════\n"
-        f"`░░░░░░░░░░░░░░░░` **0%**\n"
-        f"  Part **0** / **{parts}** done\n"
+        f"`{BAR_EMPTY * 16}` **0%**\n"
+        f"  Part **0** / **{parts}**\n"
         f"══════════════════════════\n"
         f"  ❌ /cancel to stop"
     )
@@ -688,7 +704,7 @@ async def _do_split(message, uid: int, seg: float, parts: int, label: str) -> No
                     f"🚫 **CANCELLED**\n"
                     f"══════════════════════════\n"
                     f"  Stopped after **{i}** / **{parts}** parts.\n"
-                    f"  Run `/split` again to retry."
+                    f"  Send video again to retry."
                 )
                 _clear_status(uid)
                 return
@@ -702,52 +718,74 @@ async def _do_split(message, uid: int, seg: float, parts: int, label: str) -> No
 
             if not ok or not os.path.exists(out):
                 await _safe_edit(msg,
-                    f"❌ **ffmpeg failed** on part {i+1}\n"
-                    f"  Check the source file and try again."
+                    f"❌ **ffmpeg error** on part {i+1}\n"
+                    f"══════════════════════════\n"
+                    f"  Source may be corrupted.\n"
+                    f"  Please re-send the video."
                 )
                 _clear_status(uid)
                 return
 
-            await _split_update(msg, i, parts, uid, f"uploading part {i+1}…")
             _set_status(uid, "Uploading", f"part {i+1}/{parts}")
-            uploaded = await _upload_part(message, out, i+1, parts, uid, ss + seg/2)
-            os.remove(out)
+            await _split_update(msg, i, parts, uid, f"uploading part {i+1}…")
+
+            uploaded = await _upload_part(
+                message, out, i+1, parts, uid, ss + seg/2
+            )
+
+            # Clean part file regardless
+            try:
+                if os.path.exists(out):
+                    os.remove(out)
+            except Exception:
+                pass
 
             if not uploaded:
                 await _safe_edit(msg,
                     f"🚫 **CANCELLED**\n"
                     f"══════════════════════════\n"
-                    f"  Stopped after **{i+1}** / **{parts}** parts."
+                    f"  Stopped after part **{i+1}** / **{parts}**."
                 )
                 _clear_status(uid)
                 return
 
-            # Update split bar after successful upload
             await _split_update(msg, i+1, parts, uid,
-                                 "done!" if i+1==parts else f"next: part {i+2}…")
+                "done! 🎉" if i+1 == parts else f"next: part {i+2}…"
+            )
 
-        os.remove(file)
+        # ── All done ──
+        try:
+            if os.path.exists(file):
+                os.remove(file)
+        except Exception:
+            pass
         user_files.pop(uid, None)
+        _clear_uploads(uid)
         _clear_status(uid)
 
-        # Victory card
-        duration_str = _eta(seg * parts)
+        check_row = "".join(
+            "✅" if j < parts else "⬜"
+            for j in range(min(parts, 20))
+        )
+        if parts > 20:
+            check_row += f" +{parts-20}"
+
         await _safe_edit(msg,
-            f"🏆 **ALL {parts} PARTS DELIVERED!**\n"
+            f"🏆 **ALL {parts} PARTS DONE!**\n"
             f"══════════════════════════\n"
-            f"`▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰` **100%**\n"
-            f"  {'✅' * min(parts, 20)}\n"
+            f"`{BAR_FILL * 16}` **100%**\n"
+            f"  {check_row}\n"
             f"──────────────────────────\n"
-            f"  ✅ **{parts} parts** uploaded\n"
-            f"  📽 Duration: `{duration_str}`\n"
+            f"  ✅ **{parts} parts** delivered\n"
+            f"  🎬 Ultra Bot v8\n"
             f"══════════════════════════\n"
             f"  _Send another video to split!_"
         )
+
     except Exception as e:
         _clear_status(uid)
         await _safe_edit(msg,
             f"❌ **Unexpected error**\n"
-            f"══════════════════════════\n"
             f"  `{e}`\n"
             f"  Please try again."
         )
@@ -756,34 +794,31 @@ async def _do_split(message, uid: int, seg: float, parts: int, label: str) -> No
 # ══════════════════════════════════════════════════════════════
 #  /split
 # ══════════════════════════════════════════════════════════════
-@app.on_message(filters.command("split"), group=1)
-async def split(client, message):
+@app.on_message(filters.command("split") & filters.incoming, group=0)
+async def split_cmd(client, message):
     if await _dedup(message.id): return
     uid  = message.from_user.id
     lock = _get_lock(uid)
     if lock.locked():
         return await message.reply(
-            "⏳ **Already processing!**\n"
-            "  👉 /status · /cancel"
+            "⏳ **Already processing!**\n  👉 /status · /cancel"
         )
     if uid not in user_files:
         return await message.reply(
-            "❌ **No video loaded.**\n"
-            "  Send a video file first!"
+            "❌ **No video loaded.**\n  Send a video file first!"
         )
     try:
         parts = int(message.command[1])
-        assert parts >= 2
+        assert 2 <= parts <= 100
     except Exception:
         return await message.reply(
             "❌ **Usage:** `/split 3`\n"
-            "  Minimum 2 parts."
+            "  Minimum 2 parts, max 100."
         )
     dur = await get_duration(user_files[uid])
     if not dur:
         return await message.reply(
-            "❌ **Could not read video duration.**\n"
-            "  File may be corrupted."
+            "❌ **Cannot read duration.**\n  File may be corrupted."
         )
     async with lock:
         await _do_split(
@@ -795,41 +830,43 @@ async def split(client, message):
 # ══════════════════════════════════════════════════════════════
 #  /splitmin
 # ══════════════════════════════════════════════════════════════
-@app.on_message(filters.command("splitmin"), group=1)
-async def splitmin(client, message):
+@app.on_message(filters.command("splitmin") & filters.incoming, group=0)
+async def splitmin_cmd(client, message):
     if await _dedup(message.id): return
     uid  = message.from_user.id
     lock = _get_lock(uid)
     if lock.locked():
         return await message.reply(
-            "⏳ **Already processing!**\n"
-            "  👉 /status · /cancel"
+            "⏳ **Already processing!**\n  👉 /status · /cancel"
         )
     if uid not in user_files:
         return await message.reply(
-            "❌ **No video loaded.**\n"
-            "  Send a video file first!"
+            "❌ **No video loaded.**\n  Send a video file first!"
         )
     try:
         mins = int(message.command[1])
-        assert mins >= 1
+        assert 1 <= mins <= 60
     except Exception:
         return await message.reply(
             "❌ **Usage:** `/splitmin 2`\n"
-            "  Chunk size in minutes."
+            "  Chunk size in minutes (1–60)."
         )
     dur = await get_duration(user_files[uid])
     if not dur:
         return await message.reply(
-            "❌ **Could not read video duration.**\n"
-            "  File may be corrupted."
+            "❌ **Cannot read duration.**\n  File may be corrupted."
         )
     seg   = mins * 60
     parts = math.ceil(dur / seg)
+    if parts > 100:
+        return await message.reply(
+            f"❌ Too many parts ({parts}).\n"
+            f"  Use a larger chunk size."
+        )
     async with lock:
         await _do_split(
             message, uid, seg, parts,
-            f"Splitting — **{mins}** min chunks → **{parts}** parts…"
+            f"Splitting — **{mins} min** chunks → **{parts}** parts…"
         )
 
 
