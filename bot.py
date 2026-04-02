@@ -32,6 +32,18 @@ user_status: dict[int, dict]          = {}
 _seen_msgs: set[int]     = set()
 _seen_lock: asyncio.Lock = asyncio.Lock()
 
+# Per-user command cooldown — blocks duplicate deliveries within 3s
+_last_cmd: dict[int, float] = {}
+def _cmd_cooldown(uid: int, window: float = 3.0) -> bool:
+    import time as _t
+    now  = _t.time()
+    last = _last_cmd.get(uid, 0.0)
+    if now - last < window:
+        return True
+    _last_cmd[uid] = now
+    return False
+
+
 def _get_lock(uid: int) -> asyncio.Lock:
     if uid not in user_locks:
         user_locks[uid] = asyncio.Lock()
@@ -797,7 +809,8 @@ async def _do_split(
 @app.on_message(filters.command("split") & filters.incoming, group=0)
 async def split_cmd(client, message):
     if await _dedup(message.id): return
-    uid  = message.from_user.id
+    uid = message.from_user.id
+    if _cmd_cooldown(uid): return
     lock = _get_lock(uid)
     if lock.locked():
         return await message.reply(
@@ -820,6 +833,7 @@ async def split_cmd(client, message):
         return await message.reply(
             "❌ **Cannot read duration.**\n  File may be corrupted."
         )
+    if lock.locked(): return
     async with lock:
         await _do_split(
             message, uid, dur / parts, parts,
@@ -833,7 +847,8 @@ async def split_cmd(client, message):
 @app.on_message(filters.command("splitmin") & filters.incoming, group=0)
 async def splitmin_cmd(client, message):
     if await _dedup(message.id): return
-    uid  = message.from_user.id
+    uid = message.from_user.id
+    if _cmd_cooldown(uid): return
     lock = _get_lock(uid)
     if lock.locked():
         return await message.reply(
@@ -863,6 +878,7 @@ async def splitmin_cmd(client, message):
             f"❌ Too many parts ({parts}).\n"
             f"  Use a larger chunk size."
         )
+    if lock.locked(): return
     async with lock:
         await _do_split(
             message, uid, seg, parts,
