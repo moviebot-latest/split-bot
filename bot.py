@@ -8,6 +8,7 @@ FIXES vs v12:
   4. filters.edited removed → edit_date check
   5. Debug logging          → every message logged
   6. Railway crash safe     → auto-reconnect loop
+  7. Railway DC flapping    → ipv6=False + higher sleep_threshold (NEW)
 """
 
 import os, time, math, asyncio, logging, traceback, random
@@ -25,14 +26,33 @@ API_ID    = int(os.environ["API_ID"])
 API_HASH  = os.environ["API_HASH"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 
+# ── FIXED CLIENT FOR RAILWAY (no more DC2 ↔ DC5 flapping) ──
 app = Client(
     "ultrabot",
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
-    sleep_threshold=60,
-    in_memory=True,        # ← NO .session file, no session conflict
+    in_memory=True,              # ← NO .session file, no session conflict
+    sleep_threshold=300,         # ← increased (critical for Railway)
+    ipv6=False,                  # ← fixes Railway MTProto instability
+    auto_reconnect=True,
+    connect_timeout=30,
+    reconnect_timeout=15,
 )
+
+# ── DEBUG HANDLER (add this right after Client) ──
+@app.on_message(filters.all, group=-1000)
+async def ultra_debug(_, msg):
+    """Logs every incoming message so you can see if bot is receiving"""
+    if msg.from_user:
+        log.info(
+            f"[ULTRA DEBUG] Message received → "
+            f"User={msg.from_user.id} | "
+            f"Type={'video' if msg.video else 'document' if msg.document else 'text'} | "
+            f"Chat={msg.chat.id}"
+        )
+    else:
+        log.info(f"[ULTRA DEBUG] Message received from chat {msg.chat.id}")
 
 DOWNLOAD_DIR = "downloads"
 THUMB_DIR    = "thumbs"
@@ -92,19 +112,16 @@ def _clear_done(uid):
 
 
 # ══════════════════════════════════════════════════════════════
-#  DEDUP  (no cooldown — was blocking responses)
-#  Only drops: edited messages + exact duplicate deliveries
+#  DEDUP
 # ══════════════════════════════════════════════════════════════
 _seen:    set           = set()
 _seen_lk: asyncio.Lock = asyncio.Lock()
 
 async def _is_dup(msg) -> bool:
     """Returns True if message should be DROPPED."""
-    # Drop edited messages
     if getattr(msg, "edit_date", None):
         log.info(f"DROP edited msg id={msg.id}")
         return True
-    # Drop exact duplicate delivery
     async with _seen_lk:
         key = (msg.chat.id, msg.id)
         if key in _seen:
@@ -135,7 +152,7 @@ def _clr_st(uid): user_status.pop(uid, None)
 
 
 # ══════════════════════════════════════════════════════════════
-#  VISUALS
+#  VISUALS + PROGRESS (unchanged)
 # ══════════════════════════════════════════════════════════════
 SP_DL  = ["⣾","⣽","⣻","⢿","⡿","⣟","⣯","⣷"]
 SP_CUT = ["◜","◝","◞","◟"]
@@ -199,7 +216,7 @@ def _cup(uid, real, step=2.5):
 
 
 # ══════════════════════════════════════════════════════════════
-#  SAFE EDIT
+#  SAFE EDIT + PROGRESS (unchanged)
 # ══════════════════════════════════════════════════════════════
 async def _edit(msg, txt: str):
     try:
@@ -214,9 +231,6 @@ async def _edit(msg, txt: str):
         log.warning(f"edit failed: {e}")
 
 
-# ══════════════════════════════════════════════════════════════
-#  PROGRESS
-# ══════════════════════════════════════════════════════════════
 async def _prog(cur, tot, msg, t0, uid=0, mode="📥 Download"):
     if not tot or _ev(uid).is_set(): return
     now = time.time(); el = max(now-t0, 0.001)
@@ -252,7 +266,7 @@ async def _prog(cur, tot, msg, t0, uid=0, mode="📥 Download"):
 
 
 # ══════════════════════════════════════════════════════════════
-#  FFMPEG
+#  FFMPEG + SPLIT UI + SEND PART (unchanged)
 # ══════════════════════════════════════════════════════════════
 async def _cut(inp, out, ss, t) -> bool:
     try:
@@ -290,9 +304,6 @@ async def _dur(f) -> float | None:
     except: return None
 
 
-# ══════════════════════════════════════════════════════════════
-#  SPLIT PROGRESS UI
-# ══════════════════════════════════════════════════════════════
 async def _split_ui(msg, done, total, uid, note=""):
     pct  = done * 100 // total
     t    = _stk.get(uid, 0); _stk[uid] = t+1
@@ -319,9 +330,6 @@ async def _split_ui(msg, done, total, uid, note=""):
     )
 
 
-# ══════════════════════════════════════════════════════════════
-#  SEND ONE PART
-# ══════════════════════════════════════════════════════════════
 async def _send_part(orig_msg, prog_msg, path, num, total, uid, thumb_t) -> bool:
     if _is_done(uid, num):
         log.info(f"part {num} already done, skipping")
@@ -394,7 +402,7 @@ async def _send_part(orig_msg, prog_msg, path, num, total, uid, thumb_t) -> bool
 
 
 # ══════════════════════════════════════════════════════════════
-#  /start
+#  COMMANDS (unchanged)
 # ══════════════════════════════════════════════════════════════
 @app.on_message(filters.command("start") & filters.incoming, group=0)
 async def cmd_start(_, msg):
@@ -415,18 +423,14 @@ async def cmd_start(_, msg):
         f"  🛠 `/status` · `/cancel` · `/info`\n\n"
         f"──────────────────────────\n"
         f"  🔒 OS file-lock · zero double send\n"
-        f"  🛡 Railway crash-safe\n"
+        f"  🛡 Railway crash-safe + DC stable\n"
         f"  ⚡ Auto FloodWait handler\n"
-        f"  ✅ No session conflict (in_memory)\n"
-        f"  ✅ No response delay\n"
+        f"  ✅ No session conflict\n"
         f"──────────────────────────\n"
         f"  _Ultra Bot v13 — All Fixed_ ✓"
     )
 
 
-# ══════════════════════════════════════════════════════════════
-#  /info
-# ══════════════════════════════════════════════════════════════
 @app.on_message(filters.command("info") & filters.incoming, group=0)
 async def cmd_info(_, msg):
     log.info(f"CMD /info from uid={msg.from_user.id}")
@@ -454,9 +458,6 @@ async def cmd_info(_, msg):
     )
 
 
-# ══════════════════════════════════════════════════════════════
-#  /status
-# ══════════════════════════════════════════════════════════════
 @app.on_message(filters.command("status") & filters.incoming, group=0)
 async def cmd_status(_, msg):
     log.info(f"CMD /status from uid={msg.from_user.id}")
@@ -489,9 +490,6 @@ async def cmd_status(_, msg):
     )
 
 
-# ══════════════════════════════════════════════════════════════
-#  /cancel
-# ══════════════════════════════════════════════════════════════
 @app.on_message(filters.command("cancel") & filters.incoming, group=0)
 async def cmd_cancel(_, msg):
     log.info(f"CMD /cancel from uid={msg.from_user.id}")
@@ -504,11 +502,11 @@ async def cmd_cancel(_, msg):
 
 
 # ══════════════════════════════════════════════════════════════
-#  RECEIVE VIDEO
+#  RECEIVE VIDEO + CORE SPLIT ENGINE (unchanged)
 # ══════════════════════════════════════════════════════════════
 @app.on_message(
     filters.incoming
-    & ~filters.command(["start","split","splitmin","splitsize","status","cancel","info"])
+    & \~filters.command(["start","split","splitmin","splitsize","status","cancel","info"])
     & (filters.video | filters.document),
     group=1
 )
@@ -586,9 +584,6 @@ async def recv(_, msg):
     )
 
 
-# ══════════════════════════════════════════════════════════════
-#  CORE SPLIT ENGINE
-# ══════════════════════════════════════════════════════════════
 async def _do_split(orig_msg, uid, seg, parts, label):
     session = random.randint(1, 999999)
     split_session[uid] = session
@@ -658,9 +653,6 @@ async def _do_split(orig_msg, uid, seg, parts, label):
         _release(uid)
 
 
-# ══════════════════════════════════════════════════════════════
-#  SPLIT GUARD
-# ══════════════════════════════════════════════════════════════
 async def _split_guard(msg) -> tuple[int, bool]:
     log.info(f"CMD {msg.command[0]} from uid={msg.from_user.id}")
     if await _is_dup(msg): return msg.from_user.id, False
@@ -671,9 +663,6 @@ async def _split_guard(msg) -> tuple[int, bool]:
     return uid, True
 
 
-# ══════════════════════════════════════════════════════════════
-#  /split
-# ══════════════════════════════════════════════════════════════
 @app.on_message(filters.command("split") & filters.incoming, group=0)
 async def cmd_split(_, msg):
     uid, ok = await _split_guard(msg)
@@ -695,9 +684,6 @@ async def cmd_split(_, msg):
         _release(uid)
 
 
-# ══════════════════════════════════════════════════════════════
-#  /splitmin
-# ══════════════════════════════════════════════════════════════
 @app.on_message(filters.command("splitmin") & filters.incoming, group=0)
 async def cmd_splitmin(_, msg):
     uid, ok = await _split_guard(msg)
@@ -723,9 +709,6 @@ async def cmd_splitmin(_, msg):
         _release(uid)
 
 
-# ══════════════════════════════════════════════════════════════
-#  /splitsize
-# ══════════════════════════════════════════════════════════════
 @app.on_message(filters.command("splitsize") & filters.incoming, group=0)
 async def cmd_splitsize(_, msg):
     uid, ok = await _split_guard(msg)
@@ -756,12 +739,12 @@ async def cmd_splitsize(_, msg):
 
 
 # ══════════════════════════════════════════════════════════════
-#  MAIN
+#  MAIN (auto-reconnect loop already present)
 # ══════════════════════════════════════════════════════════════
 async def main():
     while True:
         try:
-            log.info("Starting Ultra Bot v13…")
+            log.info("Starting Ultra Bot v13 (Railway stable version)…")
             await app.start()
             me = await app.get_me()
             log.info(f"Bot running as @{me.username}")
