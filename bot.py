@@ -100,7 +100,8 @@ async def _dedup(mid: int) -> bool:
 
 # Command cooldown (catches near-simultaneous duplicate deliveries)
 _cmd_ts: dict[int, float] = {}
-def _cooldown(uid: int, sec: float = 4.0) -> bool:
+CMD_WINDOW = 10.0
+def _cooldown(uid: int, sec: float = CMD_WINDOW) -> bool:
     now = time.time()
     if now - _cmd_ts.get(uid, 0) < sec: return True
     _cmd_ts[uid] = now
@@ -397,7 +398,7 @@ async def _send_part(message, prog_msg, path, num, total, uid, thumb_t):
 # ══════════════════════════════════════════════════════════════
 #  /start
 # ══════════════════════════════════════════════════════════════
-@app.on_message(filters.command("start") & filters.incoming, group=0)
+@app.on_message(filters.command("start") & filters.incoming & ~filters.edited, group=0)
 async def cmd_start(_, msg):
     if await _dedup(msg.id): return
     name=msg.from_user.first_name or "User"
@@ -427,7 +428,7 @@ async def cmd_start(_, msg):
 # ══════════════════════════════════════════════════════════════
 #  /info
 # ══════════════════════════════════════════════════════════════
-@app.on_message(filters.command("info") & filters.incoming, group=0)
+@app.on_message(filters.command("info") & filters.incoming & ~filters.edited, group=0)
 async def cmd_info(_, msg):
     if await _dedup(msg.id): return
     uid=msg.from_user.id
@@ -459,7 +460,7 @@ async def cmd_info(_, msg):
 # ══════════════════════════════════════════════════════════════
 #  /status
 # ══════════════════════════════════════════════════════════════
-@app.on_message(filters.command("status") & filters.incoming, group=0)
+@app.on_message(filters.command("status") & filters.incoming & ~filters.edited, group=0)
 async def cmd_status(_, msg):
     if await _dedup(msg.id): return
     uid=msg.from_user.id
@@ -504,7 +505,7 @@ async def cmd_status(_, msg):
 # ══════════════════════════════════════════════════════════════
 #  /cancel
 # ══════════════════════════════════════════════════════════════
-@app.on_message(filters.command("cancel") & filters.incoming, group=0)
+@app.on_message(filters.command("cancel") & filters.incoming & ~filters.edited, group=0)
 async def cmd_cancel(_, msg):
     if await _dedup(msg.id): return
     uid=msg.from_user.id
@@ -522,6 +523,7 @@ async def cmd_cancel(_, msg):
 # ══════════════════════════════════════════════════════════════
 @app.on_message(
     filters.incoming
+    & ~filters.edited
     & ~filters.command(["start","split","splitmin","splitsize","status","cancel","info"])
     & (filters.video | filters.document),
     group=1
@@ -613,7 +615,14 @@ async def recv(_, msg):
 # ══════════════════════════════════════════════════════════════
 #  CORE SPLIT ENGINE
 # ══════════════════════════════════════════════════════════════
+# Per-user split session token — if token changes mid-run, abort
+_split_session: dict[int, int] = {}
+
 async def _do_split(msg_orig, uid, seg, parts, label):
+    import random as _r
+    session = _r.randint(1, 999999)
+    _split_session[uid] = session          # stamp this run
+
     file=user_files[uid]
     ev=_cancel_ev(uid); ev.clear()
     _clear_part_locks(uid)
@@ -635,6 +644,10 @@ async def _do_split(msg_orig, uid, seg, parts, label):
                     f"🚫 **CANCELLED**\n"
                     f"  Stopped at **{i}/{parts}**."
                 )
+                return
+
+            # If another _do_split started for this user, abort this one
+            if _split_session.get(uid) != session:
                 return
 
             ss=i*seg
@@ -698,7 +711,7 @@ async def _do_split(msg_orig, uid, seg, parts, label):
 # ══════════════════════════════════════════════════════════════
 #  /split  — 3-layer guard
 # ══════════════════════════════════════════════════════════════
-@app.on_message(filters.command("split") & filters.incoming, group=0)
+@app.on_message(filters.command("split") & filters.incoming & ~filters.edited, group=0)
 async def cmd_split(_, msg):
     if await _dedup(msg.id): return          # L1: msg ID
     uid=msg.from_user.id
@@ -725,7 +738,7 @@ async def cmd_split(_, msg):
 # ══════════════════════════════════════════════════════════════
 #  /splitmin
 # ══════════════════════════════════════════════════════════════
-@app.on_message(filters.command("splitmin") & filters.incoming, group=0)
+@app.on_message(filters.command("splitmin") & filters.incoming & ~filters.edited, group=0)
 async def cmd_splitmin(_, msg):
     if await _dedup(msg.id): return
     uid=msg.from_user.id
@@ -754,7 +767,7 @@ async def cmd_splitmin(_, msg):
 # ══════════════════════════════════════════════════════════════
 #  /splitsize  — split by MB size  (NEW FEATURE)
 # ══════════════════════════════════════════════════════════════
-@app.on_message(filters.command("splitsize") & filters.incoming, group=0)
+@app.on_message(filters.command("splitsize") & filters.incoming & ~filters.edited, group=0)
 async def cmd_splitsize(_, msg):
     if await _dedup(msg.id): return
     uid=msg.from_user.id
