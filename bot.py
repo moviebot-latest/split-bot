@@ -35,9 +35,6 @@ app = Client(
     in_memory=True,              # ← NO .session file, no session conflict
     sleep_threshold=300,         # ← increased (critical for Railway)
     ipv6=False,                  # ← fixes Railway MTProto instability
-    auto_reconnect=True,
-    connect_timeout=30,
-    reconnect_timeout=15,
 )
 
 # ── DEBUG HANDLER (add this right after Client) ──
