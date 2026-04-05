@@ -2,12 +2,13 @@
 Ultra Bot v14
 ─────────────
 FIXES vs v13:
-  1. \~filters syntax error  → fixed to ~filters (CRITICAL crash fix)
-  2. Bot not responding      → from_user None guard added
-  3. /help command added     → full bilingual help message
-  4. /splitsize in /start    → now visible in welcome message
-  5. Channel post crash      → from_user check in all handlers
-  6. Version strings updated → v14 everywhere
+  1. \~filters syntax error      → fixed to ~filters (CRITICAL crash fix)
+  2. Bot not responding          → from_user None guard added
+  3. /help command added         → full help message
+  4. /splitsize in /start        → now visible in welcome message
+  5. Channel post crash          → from_user check in all handlers
+  6. Client already connected    → is_connected check before start()
+  7. Restart loop crash          → proper stop() before every retry
 """
 
 import os, time, math, asyncio, logging, traceback, random
@@ -780,6 +781,13 @@ async def cmd_splitsize(_, msg):
 async def main():
     while True:
         try:
+            # ── FIX: agar already connected ho toh pehle stop karo ──
+            if app.is_connected:
+                log.warning("Client already connected — stopping first…")
+                try: await app.stop()
+                except: pass
+                await asyncio.sleep(2)
+
             log.info("Starting Ultra Bot v14 (Railway stable version)…")
             await app.start()
             me = await app.get_me()
@@ -790,13 +798,20 @@ async def main():
                     try: os.remove(fp)
                     except: pass
             await idle()
+
         except KeyboardInterrupt:
             log.info("Stopped by user.")
+            try: await app.stop()
+            except: pass
             break
+
         except Exception as e:
             log.error(f"CRASH: {e}\n{traceback.format_exc()}")
             log.info("Restarting in 5 seconds…")
-            try: await app.stop()
+            # ── FIX: properly disconnect before retry ──
+            try:
+                if app.is_connected:
+                    await app.stop()
             except: pass
             await asyncio.sleep(5)
 
