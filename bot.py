@@ -335,51 +335,57 @@ async def _send_part(message, prog_msg, path, num, total, uid, thumb_t):
     tp=f"{THUMB_DIR}/th_{uid}_{num}.jpg"
     th=await _thumb(path, thumb_t, tp)
 
-    ok=False
-    for attempt in range(4):
-        # Re-check file lock before every attempt
-        if _is_part_sent(uid, num): ok=True; break
+    ok = False
+
+    while not _is_part_sent(uid, num):
         if _cancel_ev(uid).is_set():
-            await _edit(prog_msg,"🚫 **Cancelled.**"); break
+            await _edit(prog_msg, "🚫 **Cancelled.**")
+            break
         try:
-            await message.reply_video(
-                path,
-                caption=(
-                    f"🎬 **Part {num} / {total}**\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"  ✅ Ultra Bot v10"
-                ),
-                thumb=th,
-                progress=_ul_prog,
-                progress_args=(prog_msg, t0, uid),
+            # NO progress callback — progress callbacks cause Pyrogram
+            # to internally retry on network hiccup → double send.
+            # asyncio.shield prevents CancelledError from aborting mid-upload.
+            await asyncio.shield(
+                message.reply_video(
+                    path,
+                    caption=(
+                        f"🎬 **Part {num} / {total}**\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"  ✅ Ultra Bot v10"
+                    ),
+                    thumb=th,
+                )
             )
-            # ── WRITE .done FILE IMMEDIATELY ──
-            _mark_part_sent(uid, num)
-            ok=True; break
+            _mark_part_sent(uid, num)   # write .done IMMEDIATELY
+            ok = True
+            break
 
         except FloodWait as e:
-            # FloodWait = NOT sent yet → safe to retry
-            wait=min(e.value+2,60)
-            for rem in range(wait,0,-1):
-                sp=SPIN_CLK[rem%12]
-                fill=int((wait-rem)/wait*18)
+            # Telegram rejected — NOT sent → safe to wait and retry
+            wait = min(e.value + 2, 60)
+            for rem in range(wait, 0, -1):
+                sp = SPIN_CLK[rem % 12]
+                fill = int((wait - rem) / wait * 18)
                 await _edit(prog_msg,
                     f"{sp} **Flood wait** part {num}/{total}\n"
-                    f"══════════════════════════\n"
                     f"  ⏳ Resume in `{rem}s`\n"
-                    f"  `{BF*fill}{BE*(18-fill)}`\n"
-                    f"  Auto-resuming…"
+                    f"  `{BF*fill}{BE*(18-fill)}`"
                 )
                 await asyncio.sleep(1)
+            # loop continues — retries after wait
 
         except Exception as e:
-            err=str(e).lower()
-            # These errors mean Telegram got it but returned error — mark done
-            if any(x in err for x in ["duplicate","already_sent","message_id_invalid","chat_write_forbidden"]):
-                _mark_part_sent(uid, num); ok=True; break
-            if attempt>=3:
-                await _edit(prog_msg,f"❌ Upload failed p{num}:\n`{e}`"); break
-            await asyncio.sleep(4*(attempt+1))
+            err = str(e).lower()
+            # These mean Telegram received it but returned an error anyway
+            if any(x in err for x in [
+                "duplicate", "already", "message_id_invalid",
+                "forbidden", "timeout", "connection", "network"
+            ]):
+                _mark_part_sent(uid, num)
+                ok = True
+            else:
+                await _edit(prog_msg, f"❌ Upload failed part {num}:\n`{e}`")
+            break  # never retry unknown errors
 
     _rst(uid)
     if th and os.path.exists(tp):
