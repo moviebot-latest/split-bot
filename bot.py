@@ -431,6 +431,7 @@ async def cmd_start(_, msg):
 
 @app.on_message(filters.command("info") & filters.incoming, group=0)
 async def cmd_info(_, msg):
+    if not msg.from_user: return
     log.info(f"CMD /info from uid={msg.from_user.id}")
     if await _is_dup(msg): return
     uid = msg.from_user.id
@@ -492,7 +493,10 @@ async def cmd_help(_, msg):
 
 
 
+
+@app.on_message(filters.command("status") & filters.incoming, group=0)
 async def cmd_status(_, msg):
+    if not msg.from_user: return
     log.info(f"CMD /status from uid={msg.from_user.id}")
     if await _is_dup(msg): return
     uid  = msg.from_user.id
@@ -525,6 +529,7 @@ async def cmd_status(_, msg):
 
 @app.on_message(filters.command("cancel") & filters.incoming, group=0)
 async def cmd_cancel(_, msg):
+    if not msg.from_user: return
     log.info(f"CMD /cancel from uid={msg.from_user.id}")
     if await _is_dup(msg): return
     uid = msg.from_user.id
