@@ -1,17 +1,18 @@
 """
-Ultra Bot v12
+Ultra Bot v13
 ─────────────
-FIXES:
-  1. filters.edited REMOVED  → msg.edit_date check (Railway crash fix)
-  2. Double message FIXED    → edit_date + _dedup + cooldown on ALL handlers
-  3. Railway crash safe      → global exception handler + auto-reconnect
-  4. Double upload fixed     → NO progress callback in reply_video
-  5. Double split fixed      → atomic OS file lock + session token
+FIXES vs v12:
+  1. Bot not responding     → cooldown removed, gate simplified
+  2. Session conflict       → in_memory=True (no .session file)
+  3. Double message         → seen set on (chat_id, msg_id)
+  4. filters.edited removed → edit_date check
+  5. Debug logging          → every message logged
+  6. Railway crash safe     → auto-reconnect loop
 """
 
 import os, time, math, asyncio, logging, traceback, random
 from pyrogram import Client, filters, idle
-from pyrogram.errors import FloodWait, MessageNotModified, RPCError
+from pyrogram.errors import FloodWait, MessageNotModified
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,6 +31,7 @@ app = Client(
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
     sleep_threshold=60,
+    in_memory=True,        # ← NO .session file, no session conflict
 )
 
 DOWNLOAD_DIR = "downloads"
@@ -40,7 +42,7 @@ for _d in (DOWNLOAD_DIR, THUMB_DIR, LOCK_DIR):
 
 
 # ══════════════════════════════════════════════════════════════
-#  LOCK SYSTEM  (OS-level atomic)
+#  LOCK SYSTEM
 # ══════════════════════════════════════════════════════════════
 def _lock_file(uid):    return f"{LOCK_DIR}/{uid}.lock"
 def _done_file(uid, n): return f"{LOCK_DIR}/{uid}_p{n}.done"
@@ -90,52 +92,36 @@ def _clear_done(uid):
 
 
 # ══════════════════════════════════════════════════════════════
-#  DEDUP + COOLDOWN  ← double message fix
-#
-#  _gate(msg)           → for commands (has cooldown)
-#  _gate_nocooldown(msg)→ for video receive (no cooldown)
-#
-#  Both check:
-#    1. edit_date  → drop edited messages (replaces ~filters.edited)
-#    2. (chat,msg_id) seen set → drop Telegram duplicate deliveries
-#    3. cooldown   → drop double-taps (commands only)
+#  DEDUP  (no cooldown — was blocking responses)
+#  Only drops: edited messages + exact duplicate deliveries
 # ══════════════════════════════════════════════════════════════
-_seen:    set             = set()
-_seen_lk: asyncio.Lock   = asyncio.Lock()
-_cmd_ts:  dict[int,float] = {}
-COOLDOWN = 8.0
+_seen:    set           = set()
+_seen_lk: asyncio.Lock = asyncio.Lock()
 
-async def _gate(msg) -> bool:
+async def _is_dup(msg) -> bool:
+    """Returns True if message should be DROPPED."""
+    # Drop edited messages
     if getattr(msg, "edit_date", None):
-        return False
+        log.info(f"DROP edited msg id={msg.id}")
+        return True
+    # Drop exact duplicate delivery
     async with _seen_lk:
         key = (msg.chat.id, msg.id)
-        if key in _seen: return False
+        if key in _seen:
+            log.info(f"DROP duplicate msg id={msg.id}")
+            return True
         _seen.add(key)
         if len(_seen) > 5000: _seen.clear()
-    uid = msg.from_user.id if msg.from_user else 0
-    now = time.time()
-    if now - _cmd_ts.get(uid, 0) < COOLDOWN: return False
-    _cmd_ts[uid] = now
-    return True
-
-async def _gate_nocooldown(msg) -> bool:
-    if getattr(msg, "edit_date", None): return False
-    async with _seen_lk:
-        key = (msg.chat.id, msg.id)
-        if key in _seen: return False
-        _seen.add(key)
-        if len(_seen) > 5000: _seen.clear()
-    return True
+    return False
 
 
 # ══════════════════════════════════════════════════════════════
 #  STATE
 # ══════════════════════════════════════════════════════════════
-user_files:    dict[int, str]            = {}
-user_cancel:   dict[int, asyncio.Event]  = {}
-user_status:   dict[int, dict]           = {}
-split_session: dict[int, int]            = {}
+user_files:    dict[int, str]           = {}
+user_cancel:   dict[int, asyncio.Event] = {}
+user_status:   dict[int, dict]          = {}
+split_session: dict[int, int]           = {}
 
 def _ev(uid):
     if uid not in user_cancel:
@@ -229,7 +215,7 @@ async def _edit(msg, txt: str):
 
 
 # ══════════════════════════════════════════════════════════════
-#  PROGRESS  (download only — upload has NO callback)
+#  PROGRESS
 # ══════════════════════════════════════════════════════════════
 async def _prog(cur, tot, msg, t0, uid=0, mode="📥 Download"):
     if not tot or _ev(uid).is_set(): return
@@ -335,9 +321,6 @@ async def _split_ui(msg, done, total, uid, note=""):
 
 # ══════════════════════════════════════════════════════════════
 #  SEND ONE PART
-#  - No progress callback (prevents Pyrogram retry → double send)
-#  - asyncio.shield (prevents cancel mid-send)
-#  - .done file (idempotent — never sends twice even after crash)
 # ══════════════════════════════════════════════════════════════
 async def _send_part(orig_msg, prog_msg, path, num, total, uid, thumb_t) -> bool:
     if _is_done(uid, num):
@@ -349,7 +332,6 @@ async def _send_part(orig_msg, prog_msg, path, num, total, uid, thumb_t) -> bool
         f"📤 **Uploading part {num}/{total}**\n"
         f"══════════════════════════\n"
         f"  Please wait…\n"
-        f"  _(no progress bar = no double-send)_\n"
         f"══════════════════════════\n"
         f"  ❌ /cancel"
     )
@@ -368,10 +350,9 @@ async def _send_part(orig_msg, prog_msg, path, num, total, uid, thumb_t) -> bool
                     caption=(
                         f"🎬 **Part {num} / {total}**\n"
                         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                        f"  ✅ Ultra Bot v12"
+                        f"  ✅ Ultra Bot v13"
                     ),
                     thumb=th,
-                    # NO progress= argument — prevents double send
                 )
             )
             _mark_done(uid, num)
@@ -417,11 +398,12 @@ async def _send_part(orig_msg, prog_msg, path, num, total, uid, thumb_t) -> bool
 # ══════════════════════════════════════════════════════════════
 @app.on_message(filters.command("start") & filters.incoming, group=0)
 async def cmd_start(_, msg):
-    if not await _gate(msg): return
+    log.info(f"CMD /start from uid={msg.from_user.id}")
+    if await _is_dup(msg): return
     name = msg.from_user.first_name or "User"
     await msg.reply(
         f"╔══════════════════════════╗\n"
-        f"║  ⚡  ULTRA BOT v12  ⚡   ║\n"
+        f"║  ⚡  ULTRA BOT v13  ⚡   ║\n"
         f"╚══════════════════════════╝\n\n"
         f"  👋 Hey **{name}**!\n\n"
         f"  📽 Send any video:\n"
@@ -435,10 +417,10 @@ async def cmd_start(_, msg):
         f"  🔒 OS file-lock · zero double send\n"
         f"  🛡 Railway crash-safe\n"
         f"  ⚡ Auto FloodWait handler\n"
-        f"  ✅ filters.edited crash — FIXED\n"
-        f"  ✅ Double message — FIXED\n"
+        f"  ✅ No session conflict (in_memory)\n"
+        f"  ✅ No response delay\n"
         f"──────────────────────────\n"
-        f"  _Ultra Bot v12 — All Fixed_ ✓"
+        f"  _Ultra Bot v13 — All Fixed_ ✓"
     )
 
 
@@ -447,7 +429,8 @@ async def cmd_start(_, msg):
 # ══════════════════════════════════════════════════════════════
 @app.on_message(filters.command("info") & filters.incoming, group=0)
 async def cmd_info(_, msg):
-    if not await _gate(msg): return
+    log.info(f"CMD /info from uid={msg.from_user.id}")
+    if await _is_dup(msg): return
     uid = msg.from_user.id
     if uid not in user_files or not os.path.exists(user_files[uid]):
         return await msg.reply("❌ No video loaded.")
@@ -476,7 +459,8 @@ async def cmd_info(_, msg):
 # ══════════════════════════════════════════════════════════════
 @app.on_message(filters.command("status") & filters.incoming, group=0)
 async def cmd_status(_, msg):
-    if not await _gate(msg): return
+    log.info(f"CMD /status from uid={msg.from_user.id}")
+    if await _is_dup(msg): return
     uid  = msg.from_user.id
     info = user_status.get(uid)
     busy = _locked(uid)
@@ -510,7 +494,8 @@ async def cmd_status(_, msg):
 # ══════════════════════════════════════════════════════════════
 @app.on_message(filters.command("cancel") & filters.incoming, group=0)
 async def cmd_cancel(_, msg):
-    if not await _gate(msg): return
+    log.info(f"CMD /cancel from uid={msg.from_user.id}")
+    if await _is_dup(msg): return
     uid = msg.from_user.id
     if not _locked(uid):
         return await msg.reply("💤 Nothing running.")
@@ -528,7 +513,8 @@ async def cmd_cancel(_, msg):
     group=1
 )
 async def recv(_, msg):
-    if not await _gate_nocooldown(msg): return   # drops edited + duplicates only
+    log.info(f"VIDEO received from uid={msg.from_user.id}")
+    if await _is_dup(msg): return
     uid   = msg.from_user.id
     if _locked(uid):
         return await msg.reply("⏳ Task running.\n👉 /status · /cancel")
@@ -621,7 +607,7 @@ async def _do_split(orig_msg, uid, seg, parts, label):
     try:
         for i in range(parts):
             if split_session.get(uid) != session:
-                log.warning(f"session mismatch uid={uid}, aborting old split")
+                log.warning(f"session mismatch uid={uid}, aborting")
                 return
             if ev.is_set():
                 await _edit(prog, f"🚫 **CANCELLED**\n  Stopped at part **{i}/{parts}**.")
@@ -646,7 +632,6 @@ async def _do_split(orig_msg, uid, seg, parts, label):
             await _split_ui(prog, i+1, parts, uid,
                 "🎉 all done!" if i+1 == parts else f"next: {i+2}…"
             )
-        # SUCCESS
         try:
             if os.path.exists(file): os.remove(file)
         except: pass
@@ -660,7 +645,7 @@ async def _do_split(orig_msg, uid, seg, parts, label):
             f"`{BF*16}` **100%**\n"
             f"  {checks}\n"
             f"──────────────────────────\n"
-            f"  ✅ **{parts}** parts · Ultra Bot v12\n"
+            f"  ✅ **{parts}** parts · Ultra Bot v13\n"
             f"══════════════════════════\n"
             f"  _Send next video!_"
         )
@@ -674,10 +659,11 @@ async def _do_split(orig_msg, uid, seg, parts, label):
 
 
 # ══════════════════════════════════════════════════════════════
-#  SPLIT COMMAND GUARD
+#  SPLIT GUARD
 # ══════════════════════════════════════════════════════════════
 async def _split_guard(msg) -> tuple[int, bool]:
-    if not await _gate(msg): return msg.from_user.id, False
+    log.info(f"CMD {msg.command[0]} from uid={msg.from_user.id}")
+    if await _is_dup(msg): return msg.from_user.id, False
     uid = msg.from_user.id
     if not _acquire(uid):
         await msg.reply("⏳ Already running!\n👉 /status · /cancel")
@@ -770,12 +756,12 @@ async def cmd_splitsize(_, msg):
 
 
 # ══════════════════════════════════════════════════════════════
-#  MAIN  — Railway crash-safe auto-restart
+#  MAIN
 # ══════════════════════════════════════════════════════════════
 async def main():
     while True:
         try:
-            log.info("Starting Ultra Bot v12…")
+            log.info("Starting Ultra Bot v13…")
             await app.start()
             me = await app.get_me()
             log.info(f"Bot running as @{me.username}")
