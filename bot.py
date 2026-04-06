@@ -4,6 +4,7 @@ import math
 import asyncio
 import logging
 import traceback
+from collections import deque
 from pyrogram import Client, filters
 from pyrogram.errors import FloodWait, MessageNotModified
 
@@ -28,14 +29,15 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 os.makedirs(THUMB_DIR,    exist_ok=True)
 
 # ══════════════════════════════════════════════════════════════
-#  PER-USER STATE
+#  PER-USER STATE & DEDUPLICATION (FIXED)
 # ══════════════════════════════════════════════════════════════
 user_files:  dict[int, str]           = {}
 user_locks:  dict[int, asyncio.Lock]  = {}
 user_cancel: dict[int, asyncio.Event] = {}
 user_status: dict[int, dict]          = {}
 
-_seen_msgs: set[int]     = set()
+# FIXED: Using a sliding window (deque) blocks duplicates reliably
+_seen_msgs: deque        = deque(maxlen=500) 
 _seen_lock: asyncio.Lock = asyncio.Lock()
 
 def _get_lock(uid: int) -> asyncio.Lock:
@@ -58,16 +60,14 @@ async def _dedup(mid: int) -> bool:
     async with _seen_lock:
         if mid in _seen_msgs:
             return True
-        _seen_msgs.add(mid)
-        if len(_seen_msgs) > 300:
-            _seen_msgs.clear()
+        _seen_msgs.append(mid)
         return False
 
 
 # ══════════════════════════════════════════════════════════════
 #  PROGRESS ENGINE
 # ══════════════════════════════════════════════════════════════
-THROTTLE  = 0.2
+THROTTLE  = 0.5 # Increased slightly to reduce API spam
 EMA_ALPHA = 0.35
 SPINNER   = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"]
 
@@ -140,10 +140,10 @@ async def progress(current, total, msg, start, uid=0, mode="📥 Download"):
         f"{spin} **{mode}**\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{_bar(shown)}\n"
-        f"  {_badge(shown)} **{shown:.1f}%**  ·  {_sz(current)} / {_sz(total)}\n"
+        f"  {_badge(shown)} **{shown:.1f}%** ·  {_sz(current)} / {_sz(total)}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"  🚄 **Speed**   : `{_sz(ema)}/s`  {tier}\n"
-        f"  ⏱ **ETA**     : `{_eta(eta_s)}`\n"
+        f"  🚄 **Speed** : `{_sz(ema)}/s`  {tier}\n"
+        f"  ⏱ **ETA** : `{_eta(eta_s)}`\n"
         f"  ⏳ **Elapsed** : `{_eta(elapsed)}`\n"
         f"  ❌ /cancel to stop"
     )
@@ -188,7 +188,7 @@ async def get_duration(file) -> float | None:
 
 
 # ══════════════════════════════════════════════════════════════
-#  SPLIT UI + UPLOAD PART
+#  SPLIT UI + UPLOAD PART (RETRY LOGIC FIXED)
 # ══════════════════════════════════════════════════════════════
 async def _split_update(msg, done, total, note=""):
     pct = done * 100 // total
@@ -207,14 +207,16 @@ async def _upload_part(message, path, num, total, uid, thumb_time) -> bool:
         f"⬆️ **Upload** — part {num}/{total}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"[░░░░░░░░░░░░░░░░░░░░]\n"
-        f"  🌀 **0%**  ·  starting…"
+        f"  🌀 **0%** ·  starting…"
     )
     _reset(uid)
     t0 = time.time()
     thumb_path = f"{THUMB_DIR}/thumb_{uid}_{num}.jpg"
     thumb = await make_thumb(path, thumb_time, thumb_path)
     uploaded = False
-    for attempt in range(5):
+    
+    # FIXED: Reduced retry loop to 3 to avoid silent dual uploads
+    for attempt in range(3):
         if _get_cancel(uid).is_set():
             await _safe_edit(status, "🚫 Upload cancelled.")
             break
@@ -236,10 +238,11 @@ async def _upload_part(message, path, num, total, uid, thumb_time) -> bool:
             )
             await asyncio.sleep(wait)
         except Exception as e:
-            if attempt >= 4:
+            if attempt >= 2:
                 await _safe_edit(status, f"❌ Upload failed part {num}: `{e}`")
                 break
-            await asyncio.sleep(3)
+            await asyncio.sleep(5) # Wait longer before retrying a hard failure
+
     _reset(uid)
     if thumb and os.path.exists(thumb_path):
         try: os.remove(thumb_path)
@@ -307,6 +310,8 @@ async def _do_split(message, uid, seg, parts, label):
 # ══════════════════════════════════════════════════════════════
 #  COMMANDS
 # ══════════════════════════════════════════════════════════════
+COMMAND_LIST = ["start", "help", "split", "splitmin", "splitsize", "info", "status", "cancel"]
+
 @app.on_message(filters.command("start"), group=1)
 async def cmd_start(client, message):
     if await _dedup(message.id): return
@@ -326,7 +331,6 @@ async def cmd_start(client, message):
         f"✨ Multi-user · Async ffmpeg · Auto thumbnails\n"
         f"🔄 FloodWait safe · No crash · No double upload"
     )
-
 
 @app.on_message(filters.command("help"), group=1)
 async def cmd_help(client, message):
@@ -349,7 +353,6 @@ async def cmd_help(client, message):
         f"  `/status` → kya chal raha hai\n"
         f"  `/cancel` → rok do\n"
     )
-
 
 @app.on_message(filters.command("info"), group=1)
 async def cmd_info(client, message):
@@ -375,7 +378,6 @@ async def cmd_info(client, message):
         f"  👉 `/split N` · `/splitmin N` · `/splitsize N`"
     )
 
-
 @app.on_message(filters.command("status"), group=1)
 async def cmd_status(client, message):
     if await _dedup(message.id): return
@@ -395,12 +397,11 @@ async def cmd_status(client, message):
     await message.reply(
         f"⚙️ **Running…**\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"  📌 **Task**   : `{info['task']}`\n"
+        f"  📌 **Task** : `{info['task']}`\n"
         f"  📝 **Detail** : `{info['detail']}`\n"
-        f"  ⏳ **Time**   : `{elapsed}`\n\n"
+        f"  ⏳ **Time** : `{elapsed}`\n\n"
         f"  ❌ /cancel to stop"
     )
-
 
 @app.on_message(filters.command("cancel"), group=1)
 async def cmd_cancel(client, message):
@@ -413,9 +414,11 @@ async def cmd_cancel(client, message):
 
 
 # ══════════════════════════════════════════════════════════════
-#  RECEIVE VIDEO
+#  RECEIVE VIDEO (FIXED HANDLER CLASHING)
 # ══════════════════════════════════════════════════════════════
-@app.on_message(filters.incoming & (filters.video | filters.document), group=-1)
+# FIXED: Added `~filters.command(COMMAND_LIST)` so if a user sends a video with
+# the caption "/split 3", it doesn't trigger the receiver AND the command twice.
+@app.on_message(filters.incoming & (filters.video | filters.document) & ~filters.command(COMMAND_LIST), group=-1)
 async def receive(client, message):
     if await _dedup(message.id): return
     if not message.from_user: return
@@ -509,7 +512,6 @@ async def cmd_split(client, message):
     async with lock:
         await _do_split(message, uid, dur/parts, parts, f"Splitting into {parts} equal parts…")
 
-
 @app.on_message(filters.command("splitmin"), group=1)
 async def cmd_splitmin(client, message):
     if await _dedup(message.id): return
@@ -532,7 +534,6 @@ async def cmd_splitmin(client, message):
         return await message.reply(f"❌ Too many parts ({parts}). Bada chunk lo.")
     async with lock:
         await _do_split(message, uid, seg, parts, f"{mins} min chunks → {parts} parts…")
-
 
 @app.on_message(filters.command("splitsize"), group=1)
 async def cmd_splitsize(client, message):
@@ -561,6 +562,6 @@ async def cmd_splitsize(client, message):
     async with lock:
         await _do_split(message, uid, seg, parts, f"{mb}MB chunks → {parts} parts…")
 
-
 # ══════════════════════════════════════════════════════════════
-app.run()
+if __name__ == "__main__":
+    app.run()
