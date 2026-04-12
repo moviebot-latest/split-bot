@@ -1,4 +1,4 @@
-"""
+ """
 ╔══════════════════════════════════════════════════════════════╗
 ║              ULTRA BOT  v3.0  —  Deep Audit Edition          ║
 ╠══════════════════════════════════════════════════════════════╣
@@ -30,6 +30,7 @@
 ║  #21 0-byte part file  → size checked before upload          ║
 ║  #22 Stale cleanup ext → added .wmv .3gp patterns            ║
 ║  #23 Prune frequency   → throttled, not on every lock call   ║
+║  #24 ServerError import→ RPCError alias (latest pyrogram fix)║
 ║                                                              ║
 ║  ── NEW FEATURES v3 ─────────────────────────────────────── ║
 ║  ✦ /clear command                                            ║
@@ -50,7 +51,8 @@ import logging
 import traceback
 from collections import deque
 from pyrogram import Client, filters
-from pyrogram.errors import FloodWait, MessageNotModified, ServerError
+from pyrogram.errors import FloodWait, MessageNotModified
+from pyrogram.errors import RPCError as ServerError  # FIX #24 — ServerError removed in latest pyrogram
 
 # ══════════════════════════════════════════════════════════════
 #  LOGGING
@@ -702,7 +704,7 @@ async def cmd_cancel(client, message):
     await message.reply("🚫 **Cancel requested!**\nStopping at next checkpoint…")
 
 @app.on_message(filters.command("clear"), group=1)
-async def cmd_clear(client, message):
+async def cmd_clear(message):
     """Reset stuck user state without bot restart."""
     if await _dedup(message): return
     uid = _uid(message)
@@ -842,7 +844,6 @@ async def cmd_split(client, message):
     async with lock:
         if not _is_ready(uid):
             return await message.reply("❌ File mil nahi rahi. Dobara bhejo!")
-        # seg_override=None → _do_split computes dur/parts internally
         await _do_split(message, uid, parts,
                         seg_override=None,
                         label=f"Splitting into {parts} equal parts…")
