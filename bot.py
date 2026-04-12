@@ -1,46 +1,4 @@
-"""
-╔══════════════════════════════════════════════════════════════╗
-║              ULTRA BOT  v3.0  —  Deep Audit Edition          ║
-╠══════════════════════════════════════════════════════════════╣
-║  ALL BUGS from v1 + v2 fixed:                                ║
-║                                                              ║
-║  ── v1 FIXES (kept) ─────────────────────────────────────── ║
-║  #1  Double upload     → smart retry (FloodWait/ServerError) ║
-║  #2  asyncio.Lock      → lazy init inside event loop         ║
-║  #3  COMMAND_LIST      → defined before receive handler      ║
-║  #4  Dedup tuple       → (chat_id, msg_id) not just msg_id   ║
-║  #5  Dedup O(1)        → set+deque for fast lookup           ║
-║  #6  Race in receive   → download inside user lock           ║
-║  #7  from_user crash   → _uid() guard in all handlers        ║
-║  #8  _bar overflow     → pct clamped [0,100]                 ║
-║  #9  _split_update ÷0  → guarded                            ║
-║  #10 ffmpeg hang       → asyncio.wait_for() timeouts         ║
-║  #11 Memory leak       → user state pruned at 2000           ║
-║  #12 Env crash         → _require_env() with sys.exit        ║
-║  #13 Stale files       → cleaned on startup                  ║
-║  #14 BadRequest import → removed                             ║
-║  #15 File re-validate  → checked inside lock                 ║
-║                                                              ║
-║  ── NEW v3 FIXES (deep audit) ───────────────────────────── ║
-║  #16 Dedup eviction bug→ set cleaned BEFORE append, not after║
-║  #17 Prune kills tasks → locked users are never pruned       ║
-║  #18 Zombie processes  → proc.wait() after every proc.kill() ║
-║  #19 API_ID ValueError → int() wrapped in try/except         ║
-║  #20 Duration race     → re-fetched INSIDE lock              ║
-║  #21 0-byte part file  → size checked before upload          ║
-║  #22 Stale cleanup ext → added .wmv .3gp patterns            ║
-║  #23 Prune frequency   → throttled, not on every lock call   ║
-║  #24 ServerError import→ RPCError alias (latest pyrogram fix)║
-║                                                              ║
-║  ── NEW FEATURES v3 ─────────────────────────────────────── ║
-║  ✦ /clear command                                            ║
-║  ✦ 2 GB size warning                                         ║
-║  ✦ ffmpeg stderr logging on failure                          ║
-║  ✦ Startup file cleanup                                      ║
-║  ✦ Part integrity check (0-byte guard)                       ║
-╚══════════════════════════════════════════════════════════════╝
-"""
-
+# Ultra Bot v3.0 — FIX #24: RPCError as ServerError (latest pyrogram)
 import os
 import sys
 import glob
@@ -464,7 +422,7 @@ async def _upload_part(message, path: str, num: int, total: int,
     thumb = await make_thumb(path, thumb_time, thumb_path)
     uploaded = False
 
-    for attempt in range(3):
+    for attempt in range(2):  # max 1 FloodWait retry, never retry on other errors
         if _get_cancel(uid).is_set():
             await _safe_edit(status, "🚫 Upload cancelled.")
             break
@@ -480,7 +438,7 @@ async def _upload_part(message, path: str, num: int, total: int,
             break  # ✅ NEVER retry after success — prevents double upload
 
         except FloodWait as e:
-            # Safe: Telegram rejected request before accepting the file
+            # Safe to retry: FloodWait means Telegram rejected before storing
             wait = e.value + 2
             await _safe_edit(status,
                 f"⏳ **Flood wait** — part {num}/{total}\n"
@@ -488,16 +446,9 @@ async def _upload_part(message, path: str, num: int, total: int,
             )
             await asyncio.sleep(wait)
 
-        except ServerError as e:
-            # Safe: server-side error before file was stored
-            if attempt >= 2:
-                await _safe_edit(status, f"❌ Upload failed part {num}: `{e}`")
-                break
-            log.warning(f"ServerError part {num}, attempt {attempt+1}: {e}")
-            await asyncio.sleep(5)
-
         except Exception as e:
-            # ⚠️ DO NOT RETRY — file may already have been sent to Telegram
+            # ⚠️ NEVER RETRY — file may already have been sent to Telegram
+            # ServerError, RPCError, network errors etc — all treated as no-retry
             log.error(f"Upload part {num} (no retry): {e}")
             await _safe_edit(status, f"❌ Upload failed part {num}: `{e}`")
             break
@@ -771,14 +722,17 @@ async def receive(client, message):
     if file_size and file_size > MAX_FILE_WARN:
         size_warn = f"\n  ⚠️ File `{sz_str}` — near Telegram 2 GB limit!"
 
-    status = await message.reply(
-        f"📥 **Downloading…** `{ext.upper()}` · {sz_str}{size_warn}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"⏳ Starting…"
-    )
-
-    # Entire download inside lock → prevents race on rapid double-send
+    # FIX double message: acquire lock BEFORE sending status reply
+    # so only one task ever starts the download for this user
+    if lock.locked():
+        return  # silently drop — first task already handling it
     async with lock:
+        status = await message.reply(
+            f"📥 **Downloading…** `{ext.upper()}` · {sz_str}{size_warn}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"⏳ Starting…"
+        )
+
         old_path = user_files.pop(uid, None)
         if old_path and os.path.exists(old_path):
             try: os.remove(old_path)
