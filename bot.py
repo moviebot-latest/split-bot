@@ -14,6 +14,22 @@ from pyrogram import Client, filters
 from pyrogram.errors import FloodWait, MessageNotModified
 from pyrogram.errors import RPCError as ServerError  # FIX #24 — ServerError removed in latest pyrogram
 
+
+from flask import Flask
+from threading import Thread
+
+web = Flask(__name__)
+
+@web.route("/")
+def home():
+    return "Ultra Bot is Running!"
+
+def run_web():
+    port = int(os.environ.get("PORT", 10000))
+    web.run(host="0.0.0.0", port=port)
+
+Thread(target=run_web, daemon=True).start()
+
 try:
     from groq import AsyncGroq
 except ImportError:
