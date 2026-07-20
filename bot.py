@@ -1,7 +1,9 @@
-# Ultra Bot v3.0 — FIX #24: RPCError as ServerError (latest pyrogram)
+# Ultra Bot v6.0 — FIX #32/#33: Live %/speed/ETA progress engine extended to
+# compress, merge, scene-detect, split & trim (previously download/upload only)
 import os
 import sys
 import re
+import json
 import glob
 import time
 import math
@@ -11,24 +13,9 @@ import logging
 import traceback
 from collections import deque
 from pyrogram import Client, filters
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import FloodWait, MessageNotModified
 from pyrogram.errors import RPCError as ServerError  # FIX #24 — ServerError removed in latest pyrogram
-
-
-from flask import Flask
-from threading import Thread
-
-web = Flask(__name__)
-
-@web.route("/")
-def home():
-    return "Ultra Bot is Running!"
-
-def run_web():
-    port = int(os.environ.get("PORT", 10000))
-    web.run(host="0.0.0.0", port=port)
-
-Thread(target=run_web, daemon=True).start()
 
 try:
     from groq import AsyncGroq
@@ -86,6 +73,7 @@ BOT_TOKEN = _require_env("BOT_TOKEN")
 GROQ_API_KEY      = os.getenv("GROQ_API_KEY", "").strip()
 GROQ_MODEL        = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b").strip()
 GROQ_VISION_MODEL = os.getenv("GROQ_VISION_MODEL", "qwen/qwen3.6-27b").strip()
+WHISPER_MODEL     = os.getenv("GROQ_WHISPER_MODEL", "whisper-large-v3-turbo").strip()
 AI_ENABLED        = bool(GROQ_API_KEY and AsyncGroq is not None)
 _groq_client       = AsyncGroq(api_key=GROQ_API_KEY) if AI_ENABLED else None
 AI_TIMEOUT         = 8   # seconds — captions never stall the upload pipeline
@@ -126,6 +114,13 @@ FFMPEG_AUDIO_TIMEOUT    = 300          # 5 min for audio extraction
 SCENE_DETECT_TIMEOUT    = 600          # 10 min — full decode pass, same budget as FFMPEG_CUT_TIMEOUT
 MAX_MERGE_VIDEOS        = 20           # cap merge queue size
 COMPRESS_PRESETS        = {"low": 28, "medium": 23, "high": 18}  # CRF values (lower = better quality)
+WHISPER_MAX_BYTES       = 24 * 1024 * 1024   # stay under Groq's 25MB free-tier cap, with margin
+WHISPER_CHUNK_SECONDS   = 1200                # 20 min per transcription chunk if audio is too big
+TRANSCRIBE_TIMEOUT      = 120                 # per-chunk Whisper API timeout
+HIGHLIGHT_MIN_SEC       = 20                  # floor — LLM picks are clamped/filtered around this
+HIGHLIGHT_MAX_SEC       = 70                  # ceiling
+HIGHLIGHT_MIN_COUNT     = 5
+HIGHLIGHT_MAX_COUNT     = 10
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 os.makedirs(THUMB_DIR,    exist_ok=True)
@@ -365,12 +360,12 @@ def _count_up(uid: int, real: float, step: float = 1.8) -> float:
     _shown_pct[uid] = shown
     return shown
 
-async def _safe_edit(msg, text: str) -> None:
+async def _safe_edit(msg, text: str, reply_markup=None) -> None:
     try:
-        await msg.edit(text)
+        await msg.edit(text, reply_markup=reply_markup)
     except FloodWait as e:
         await asyncio.sleep(e.value + 0.5)
-        try: await msg.edit(text)
+        try: await msg.edit(text, reply_markup=reply_markup)
         except: pass
     except MessageNotModified:
         pass
@@ -495,15 +490,73 @@ async def get_duration(file: str) -> float | None:
 
 # ══════════════════════════════════════════════════════════════
 #  ADVANCED FFMPEG OPS — merge, compress, extract audio, scene detect
-#  These use a polling loop (proc.wait() with short timeout) instead
-#  of parsing ffmpeg's -progress stream — simpler and avoids the
-#  known out_time_ms unit quirk in some ffmpeg builds. Cancel-aware
-#  and time-boxed, same safety pattern as ffmpeg_cut above.
 # ══════════════════════════════════════════════════════════════
+async def _emit_ffmpeg_progress(uid: int, status_msg, label: str, snap: dict[str, str],
+                                t0: float, total_duration: float) -> None:
+    """Shared renderer for ffmpeg `-progress pipe:1` snapshots — same visual
+    language (bar/badge/spinner/speed/ETA) as the download/upload `progress()`
+    engine, so every long-running operation in the bot looks and feels the
+    same. Used by compress, merge, and scene-detection.
+
+    FIX #32 — reads `out_time_us` (ffmpeg's newer, unambiguously-named field)
+    rather than the legacy `out_time_ms` — verified empirically that both
+    carry the identical microsecond value, but `_us` doesn't need a comment
+    explaining a naming quirk. Rate is computed from OUR OWN elapsed-time /
+    video-seconds-processed ratio (EMA-smoothed like the download/upload
+    speed) rather than trusting ffmpeg's own `speed=` field, which can read
+    `N/A` or lag right after a seek/keyframe.
+    """
+    now = time.time()
+    if now - _last_edit.get(uid, 0.0) < THROTTLE and _last_edit.get(uid, 0.0) != 0.0:
+        return
+    _last_edit[uid] = now
+    elapsed = max(now - t0, 0.001)
+
+    out_us = snap.get("out_time_us", "")
+    try:
+        out_sec = max(0.0, float(out_us) / 1_000_000) if out_us and out_us != "N/A" else 0.0
+    except ValueError:
+        out_sec = 0.0
+
+    raw_rate = out_sec / elapsed
+    ema = EMA_ALPHA * raw_rate + (1 - EMA_ALPHA) * _ema_speed.get(uid, raw_rate)
+    _ema_speed[uid] = ema
+
+    pct   = min(100.0, out_sec * 100 / total_duration) if total_duration > 0 else 0.0
+    shown = _count_up(uid, pct)
+    spin  = SPINNER[_spin_idx.get(uid, 0) % len(SPINNER)]
+    _spin_idx[uid] = _spin_idx.get(uid, 0) + 1
+
+    eta_s   = (total_duration - out_sec) / ema if ema > 0 else 0.0
+    eta_txt = _eta(eta_s) if eta_s < 359999 else "calculating…"  # guard absurd values
+
+    await _safe_edit(status_msg,
+        f"{spin} **{label}**\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{_bar(shown)}\n"
+        f"  {_badge(shown)} **{shown:.1f}%**  ·  `{_eta(out_sec)}` / `{_eta(total_duration)}`\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"  🚄 **Speed** : `{ema:.2f}x realtime`\n"
+        f"  ⏱ **ETA** : `{eta_txt}`  ·  ⏳ `{_eta(elapsed)}`\n"
+        f"  ❌ /cancel to stop"
+    )
+
+
 async def _run_ffmpeg_polled(args: list[str], uid: int, status_msg, label: str,
-                             timeout: int) -> bool:
-    """Run an ffmpeg command, updating status_msg with elapsed time + spinner
-    every ~2s, honoring /cancel. Returns True iff ffmpeg exits with code 0.
+                             timeout: int, total_duration: float | None = None) -> bool:
+    """Run an ffmpeg command, updating status_msg live, honoring /cancel.
+    Returns True iff ffmpeg exits with code 0.
+
+    FIX #32 — when `total_duration` (seconds) is known, streams the full
+    bar/%/speed/ETA UI via `-progress pipe:1` (see _emit_ffmpeg_progress),
+    correctly batching the several key=value lines ffmpeg emits per snapshot
+    and only rendering once the `progress=` marker line closes that batch
+    (rather than reacting to each field the instant it's seen, which can
+    pair a fresh position with stale size/speed fields from the previous
+    snapshot). When duration isn't known, or if progress lines stop arriving
+    for a few seconds (e.g. a build without -progress support, or a stalled
+    pipe), falls back to the original elapsed-time + spinner display — same
+    safety net as before, never blocks either way.
 
     FIX #28 — ffmpeg writes continuous stats to stderr by default; if nobody
     drains that pipe, the OS buffer (~64KB) fills up and ffmpeg blocks on
@@ -512,10 +565,13 @@ async def _run_ffmpeg_polled(args: list[str], uid: int, status_msg, label: str,
     task drains stderr as a belt-and-suspenders fix, keeping only the tail
     for error logging.
     """
+    use_progress = bool(total_duration and total_duration > 0)
     try:
         proc = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-y", "-loglevel", "error", "-nostats", *args,
-            stdout=asyncio.subprocess.DEVNULL,
+            "ffmpeg", "-y", "-loglevel", "error", "-nostats",
+            *(["-progress", "pipe:1"] if use_progress else []),
+            *args,
+            stdout=asyncio.subprocess.PIPE if use_progress else asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )
     except Exception as e:
@@ -536,9 +592,39 @@ async def _run_ffmpeg_polled(args: list[str], uid: int, status_msg, label: str,
         except Exception:
             pass
 
-    drain_task = asyncio.create_task(_drain_stderr())
+    _reset(uid)
     t0 = time.time()
     spin_i = 0
+    last_progress_seen = t0
+    drain_task = asyncio.create_task(_drain_stderr())
+    progress_task = None
+
+    if use_progress:
+        async def _read_stdout_progress():
+            nonlocal last_progress_seen
+            buf = b""
+            snap: dict[str, str] = {}
+            try:
+                while True:
+                    chunk = await proc.stdout.read(4096)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        s = line.decode(errors="ignore").strip()
+                        if "=" not in s:
+                            continue
+                        k, _, v = s.partition("=")
+                        snap[k] = v
+                        if k == "progress":
+                            last_progress_seen = time.time()
+                            await _emit_ffmpeg_progress(uid, status_msg, label, snap, t0, total_duration)
+                            snap = {}
+            except Exception:
+                pass
+        progress_task = asyncio.create_task(_read_stdout_progress())
+
     try:
         while True:
             if _get_cancel(uid).is_set():
@@ -552,20 +638,28 @@ async def _run_ffmpeg_polled(args: list[str], uid: int, status_msg, label: str,
                 await asyncio.wait_for(proc.wait(), timeout=2)
                 break  # process exited
             except asyncio.TimeoutError:
-                spin = SPINNER[spin_i % len(SPINNER)]
-                spin_i += 1
-                await _safe_edit(status_msg,
-                    f"{spin} **{label}**\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"  ⏳ Elapsed: `{_eta(time.time()-t0)}`\n"
-                    f"  ❌ /cancel to stop"
-                )
+                # Fallback spinner — only if real progress lines aren't
+                # actually coming through (no duration, or a stale/stuck feed)
+                if not use_progress or (time.time() - last_progress_seen > 4):
+                    spin = SPINNER[spin_i % len(SPINNER)]
+                    spin_i += 1
+                    await _safe_edit(status_msg,
+                        f"{spin} **{label}**\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"  ⏳ Elapsed: `{_eta(time.time()-t0)}`\n"
+                        f"  ❌ /cancel to stop"
+                    )
     finally:
         drain_task.cancel()
-        try:
-            await drain_task
-        except (asyncio.CancelledError, Exception):
-            pass
+        if progress_task:
+            progress_task.cancel()
+        for t in (drain_task, progress_task):
+            if t is None:
+                continue
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
 
     if proc.returncode != 0:
         tail = b"".join(stderr_chunks).decode(errors="ignore")[-400:]
@@ -576,9 +670,20 @@ async def _run_ffmpeg_polled(args: list[str], uid: int, status_msg, label: str,
 async def ffmpeg_merge(file_list: list[str], out: str, uid: int, status_msg,
                        timeout: int = FFMPEG_MERGE_TIMEOUT) -> bool:
     """Merge videos in order using ffmpeg's concat demuxer. Falls back to
-    a re-encoding concat if stream-copy fails (common with mismatched codecs)."""
+    a re-encoding concat if stream-copy fails (common with mismatched codecs).
+
+    FIX #32 — total duration (summed across all inputs, probed in PARALLEL so
+    one slow ffprobe can't serialize the rest) is computed internally and fed
+    to _run_ffmpeg_polled, so both the stream-copy attempt and the re-encode
+    fallback show a real %/speed/ETA bar instead of just an elapsed spinner.
+    If any single probe fails, we fall back to the spinner entirely rather
+    than show a percentage computed from incomplete data.
+    """
     concat_path = f"{DOWNLOAD_DIR}/concat_{uid}.txt"
     try:
+        durations = await asyncio.gather(*(get_duration(fp) for fp in file_list))
+        total_duration = sum(durations) if all(durations) else None
+
         with open(concat_path, "w") as f:
             for fp in file_list:
                 safe = os.path.abspath(fp).replace("'", "'\\''")
@@ -587,6 +692,7 @@ async def ffmpeg_merge(file_list: list[str], out: str, uid: int, status_msg,
         ok = await _run_ffmpeg_polled(
             ["-f", "concat", "-safe", "0", "-i", concat_path, "-c", "copy", out],
             uid, status_msg, f"Merging {len(file_list)} videos…", timeout,
+            total_duration=total_duration,
         )
         if not ok and not _get_cancel(uid).is_set():
             log.info("Stream-copy merge failed — retrying with re-encode fallback.")
@@ -597,6 +703,7 @@ async def ffmpeg_merge(file_list: list[str], out: str, uid: int, status_msg,
                 ["-f", "concat", "-safe", "0", "-i", concat_path,
                  "-c:v", "libx264", "-preset", "veryfast", "-c:a", "aac", out],
                 uid, status_msg, f"Merging {len(file_list)} videos (re-encode)…", timeout,
+                total_duration=total_duration,
             )
         return ok
     except Exception as e:
@@ -609,11 +716,17 @@ async def ffmpeg_merge(file_list: list[str], out: str, uid: int, status_msg,
 
 async def ffmpeg_compress(inp: str, out: str, crf: int, uid: int, status_msg,
                           timeout: int = FFMPEG_COMPRESS_TIMEOUT) -> bool:
-    """Re-encode at given CRF to shrink file size."""
+    """Re-encode at given CRF to shrink file size.
+
+    FIX #32 — duration is probed internally to feed _run_ffmpeg_polled's live
+    %/speed/ETA bar; if the probe fails for any reason this just falls back
+    to the elapsed-time spinner, so a probe failure never blocks compression.
+    """
+    dur = await get_duration(inp)
     return await _run_ffmpeg_polled(
         ["-i", inp, "-c:v", "libx264", "-crf", str(crf), "-preset", "veryfast",
          "-c:a", "aac", "-b:a", "128k", out],
-        uid, status_msg, "Compressing…", timeout,
+        uid, status_msg, "Compressing…", timeout, total_duration=dur,
     )
 
 
@@ -640,8 +753,8 @@ async def ffmpeg_extract_audio(inp: str, out: str,
         return False
 
 
-async def detect_scenes(file: str, threshold: float = 10.0,
-                        max_cuts: int = 99) -> list[float]:
+async def detect_scenes(file: str, uid: int, status_msg, total_duration: float,
+                        threshold: float = 10.0, max_cuts: int = 99) -> list[float]:
     """Detect scene-change timestamps using ffmpeg's `scdet` filter.
 
     FIX #29 — originally used the classic `select='gt(scene,X)'` heuristic
@@ -656,6 +769,16 @@ async def detect_scenes(file: str, threshold: float = 10.0,
     our own threshold in Python — with an adaptive step-down if nothing
     clears it, since natural score distributions vary a lot by content
     type (animation vs. live-action vs. screen recordings, etc.).
+
+    FIX #32 — this used to run silently for up to SCENE_DETECT_TIMEOUT
+    (10 min) with zero feedback beyond the initial "Scanning…" message. Now
+    streams the same live bar/%/speed/ETA UI as compress/merge via
+    `-progress pipe:1` on stdout, while stderr — needed in FULL, every
+    frame's scdet score/time debug line, not just a tail — is drained
+    concurrently on its own task instead of one blocking communicate() call.
+    A size cap still guards memory on very long/high-framerate videos (past
+    the cap, scoring data is silently dropped rather than crashing — a very
+    long scan may only find cuts in the portion that fit).
     """
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -663,19 +786,84 @@ async def detect_scenes(file: str, threshold: float = 10.0,
             "-filter:v", "scdet=threshold=0",
             "-f", "null", "-",
             "-loglevel", "debug",
-            stdout=asyncio.subprocess.DEVNULL,
+            "-progress", "pipe:1", "-nostats",
+            stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        try:
-            _, stderr_data = await asyncio.wait_for(
-                proc.communicate(), timeout=SCENE_DETECT_TIMEOUT
-            )
-        except asyncio.TimeoutError:
-            await _kill_proc(proc)
-            log.error(f"detect_scenes timed out: {file}")
-            return []
+    except Exception as e:
+        log.error(f"detect_scenes failed to start: {e}")
+        return []
 
-        text = stderr_data.decode(errors="ignore")
+    MAX_STDERR_BYTES = 24 * 1024 * 1024  # safety cap — debug logging on very long videos
+    stderr_chunks: list[bytes] = []
+    stderr_total = 0
+
+    async def _drain_stderr_full():
+        nonlocal stderr_total
+        try:
+            while True:
+                chunk = await proc.stderr.read(65536)
+                if not chunk:
+                    break
+                stderr_total += len(chunk)
+                if stderr_total <= MAX_STDERR_BYTES:
+                    stderr_chunks.append(chunk)
+        except Exception:
+            pass
+
+    async def _read_stdout_progress():
+        buf = b""
+        snap: dict[str, str] = {}
+        try:
+            while True:
+                chunk = await proc.stdout.read(4096)
+                if not chunk:
+                    break
+                buf += chunk
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    s = line.decode(errors="ignore").strip()
+                    if "=" not in s:
+                        continue
+                    k, _, v = s.partition("=")
+                    snap[k] = v
+                    if k == "progress":
+                        await _emit_ffmpeg_progress(uid, status_msg, "🔍 Scanning for scenes…",
+                                                    snap, t0, total_duration)
+                        snap = {}
+        except Exception:
+            pass
+
+    _reset(uid)
+    t0 = time.time()
+    drain_task = asyncio.create_task(_drain_stderr_full())
+    progress_task = asyncio.create_task(_read_stdout_progress())
+
+    try:
+        while True:
+            if _get_cancel(uid).is_set():
+                await _kill_proc(proc)
+                return []
+            if time.time() - t0 > SCENE_DETECT_TIMEOUT:
+                await _kill_proc(proc)
+                log.error(f"detect_scenes timed out: {file}")
+                return []
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=1)
+                break
+            except asyncio.TimeoutError:
+                continue
+    finally:
+        drain_task.cancel()
+        progress_task.cancel()
+        for t in (drain_task, progress_task):
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    try:
+        text = b"".join(stderr_chunks).decode(errors="ignore")
         pairs = re.findall(
             r"lavfi\.scd\.score:\s*([\d.]+),\s*lavfi\.scd\.time:\s*([\d.]+)", text
         )
@@ -698,6 +886,222 @@ async def detect_scenes(file: str, threshold: float = 10.0,
     except Exception as e:
         log.error(f"detect_scenes exception: {e}")
         return []
+
+
+# ══════════════════════════════════════════════════════════════
+#  AI HIGHLIGHT EXTRACTION — /highlights
+#  Content-aware alternative to /splitscene. Instead of cutting at every
+#  visual shot change (which can produce dozens of tiny, meaningless
+#  clips on heavily-edited content like TV/movies), this transcribes the
+#  dialogue and asks the LLM to pick a handful of genuinely "best" /
+#  shareable moments — the way a person skimming a transcript would.
+# ══════════════════════════════════════════════════════════════
+async def _cut_audio(inp: str, out: str, start: float, dur: float,
+                     timeout: int = FFMPEG_CUT_TIMEOUT) -> bool:
+    """Stream-copy cut of an audio-only file (used for chunking before
+    transcription) — deliberately separate from ffmpeg_cut (video-oriented)
+    to avoid any cross-contamination between the two code paths."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-ss", str(start), "-i", inp, "-t", str(dur), "-c", "copy", out,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            await _kill_proc(proc)
+            return False
+        return proc.returncode == 0
+    except Exception as e:
+        log.error(f"_cut_audio exception: {e}")
+        return False
+
+
+async def _extract_speech_audio(inp: str, out: str,
+                                timeout: int = FFMPEG_AUDIO_TIMEOUT) -> bool:
+    """Extract a small, speech-optimized mono track (16kHz, low bitrate) —
+    this is for transcription accuracy/size, not listening quality, so it
+    stays well under Groq's per-file size limit for as long as possible."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-i", inp, "-vn", "-ar", "16000", "-ac", "1",
+            "-c:a", "libmp3lame", "-b:a", "48k", out,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            _, stderr_data = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            await _kill_proc(proc)
+            return False
+        if proc.returncode != 0:
+            log.error(f"_extract_speech_audio rc={proc.returncode}: {stderr_data.decode(errors='ignore')[-300:]}")
+        return proc.returncode == 0
+    except Exception as e:
+        log.error(f"_extract_speech_audio exception: {e}")
+        return False
+
+
+async def _transcribe_chunk(path: str) -> list[dict]:
+    """Transcribe one audio file (must already be under Groq's size limit)
+    via Whisper. Returns [{start, end, text}, ...] with LOCAL timestamps
+    (relative to the start of this specific file) — [] on any failure."""
+    if not AI_ENABLED:
+        return []
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        resp = await asyncio.wait_for(
+            _groq_client.audio.transcriptions.create(
+                file=(os.path.basename(path), data),
+                model=WHISPER_MODEL,
+                response_format="verbose_json",
+                timestamp_granularities=["segment"],
+            ),
+            timeout=TRANSCRIBE_TIMEOUT,
+        )
+        segments = getattr(resp, "segments", None)
+        if segments is None and isinstance(resp, dict):
+            segments = resp.get("segments", [])
+        out = []
+        for seg in (segments or []):
+            try:
+                if isinstance(seg, dict):
+                    out.append({"start": float(seg["start"]), "end": float(seg["end"]),
+                               "text": str(seg["text"])})
+                else:
+                    out.append({"start": float(seg.start), "end": float(seg.end),
+                               "text": str(seg.text)})
+            except (KeyError, AttributeError, ValueError, TypeError):
+                continue
+        return out
+    except asyncio.TimeoutError:
+        log.warning(f"Whisper transcription timed out: {path}")
+        return []
+    except Exception as e:
+        log.warning(f"Whisper transcription failed: {e}")
+        return []
+
+
+async def _transcribe_video(file: str, dur: float, uid: int, status_msg) -> list[dict]:
+    """Extract speech audio, chunk it if it's too big for a single Whisper
+    call, transcribe each piece, and merge into one list of {start, end,
+    text} segments with GLOBAL timestamps (chunk-offset corrected)."""
+    audio_path = f"{DOWNLOAD_DIR}/speech_{uid}.mp3"
+    ok = await _extract_speech_audio(file, audio_path)
+    if not ok or not os.path.exists(audio_path):
+        return []
+
+    size = os.path.getsize(audio_path)
+    if size <= WHISPER_MAX_BYTES:
+        segments = await _transcribe_chunk(audio_path)
+        try: os.remove(audio_path)
+        except: pass
+        return segments
+
+    # Too big for one call — chunk and offset timestamps
+    all_segments: list[dict] = []
+    n_chunks = math.ceil(dur / WHISPER_CHUNK_SECONDS)
+    for i in range(n_chunks):
+        if _get_cancel(uid).is_set():
+            break
+        start = i * WHISPER_CHUNK_SECONDS
+        seg_len = min(WHISPER_CHUNK_SECONDS, dur - start)
+        if seg_len <= 0:
+            break
+        chunk_path = f"{DOWNLOAD_DIR}/speech_{uid}_c{i}.mp3"
+        await _safe_edit(status_msg, f"🎙 **Transcribing…** chunk {i+1}/{n_chunks}")
+        cok = await _cut_audio(audio_path, chunk_path, start, seg_len)
+        if cok and os.path.exists(chunk_path):
+            segs = await _transcribe_chunk(chunk_path)
+            for s in segs:
+                all_segments.append({"start": s["start"] + start, "end": s["end"] + start,
+                                     "text": s["text"]})
+            try: os.remove(chunk_path)
+            except: pass
+    try: os.remove(audio_path)
+    except: pass
+    return all_segments
+
+
+async def _select_highlights(segments: list[dict], duration: float) -> list[dict]:
+    """Ask the LLM to pick the 5-10 best highlight-worthy moments from a
+    timestamped transcript. Returns [{start, end, reason}, ...], validated,
+    clamped to sane durations, de-overlapped, and ranked-order preserved.
+    Empty list on any failure — caller shows a graceful fallback message."""
+    if not AI_ENABLED or not segments:
+        return []
+
+    lines = []
+    for s in segments:
+        m, sec = divmod(int(s["start"]), 60)
+        lines.append(f"[{m:02d}:{sec:02d}] {s['text'].strip()}")
+    transcript = "\n".join(lines)
+    if len(transcript) > 60000:  # guard against blowing the LLM's context window
+        transcript = transcript[:60000] + "\n...[transcript truncated]"
+
+    prompt = (
+        f"You are selecting the best highlight clips from a {duration/60:.0f}-minute "
+        f"video for social media, aiming for maximum shareable/viral potential.\n\n"
+        f"Timestamped transcript:\n{transcript}\n\n"
+        f"Select {HIGHLIGHT_MIN_COUNT} to {HIGHLIGHT_MAX_COUNT} of the BEST moments as "
+        f"standalone clips. Rules:\n"
+        f"- Each clip must be {HIGHLIGHT_MIN_SEC}-{HIGHLIGHT_MAX_SEC} seconds long\n"
+        f"- Pick moments with strong drama, emotion, comedy, conflict, a punchline, "
+        f"a twist, or a cliffhanger — not random ordinary dialogue\n"
+        f"- Prefer self-contained moments that make sense without extra context\n"
+        f"- Clips must not overlap\n"
+        f"- Order by how good/viral-worthy each is, best first\n\n"
+        f'Respond ONLY with JSON in this exact shape: '
+        f'{{"highlights": [{{"start": 123.4, "end": 165.0, "reason": "short reason, max 10 words"}}, ...]}}'
+    )
+    try:
+        resp = await asyncio.wait_for(
+            _groq_client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=1200,
+                temperature=0.4,
+                response_format={"type": "json_object"},
+            ),
+            timeout=60,
+        )
+        data = json.loads(resp.choices[0].message.content)
+        items = data.get("highlights", []) if isinstance(data, dict) else []
+    except asyncio.TimeoutError:
+        log.warning("_select_highlights timed out.")
+        return []
+    except Exception as e:
+        log.warning(f"_select_highlights LLM call/parse failed: {e}")
+        return []
+
+    picked = []
+    for it in items:
+        try:
+            start = float(it["start"])
+            end = float(it["end"])
+            reason = str(it.get("reason", "")).strip()[:80]
+        except (KeyError, TypeError, ValueError):
+            continue
+        if start < 0 or end <= start or end > duration + 1:
+            continue
+        if end - start > HIGHLIGHT_MAX_SEC:           # never exceed the user's stated ceiling
+            end = start + HIGHLIGHT_MAX_SEC
+        if end - start < HIGHLIGHT_MIN_SEC * 0.5:     # way too short to be a real pick — discard
+            continue
+        picked.append({"start": start, "end": min(end, duration), "reason": reason or "Highlight moment"})
+
+    # Remove overlaps (keep earlier/higher-ranked picks), preserve original rank order
+    picked_by_time = sorted(range(len(picked)), key=lambda i: picked[i]["start"])
+    keep_idx = set()
+    last_end = -1.0
+    for i in picked_by_time:
+        if picked[i]["start"] >= last_end - 1:
+            keep_idx.add(i)
+            last_end = picked[i]["end"]
+    final = [picked[i] for i in range(len(picked)) if i in keep_idx]
+    return final[:HIGHLIGHT_MAX_COUNT]
 
 
 # ══════════════════════════════════════════════════════════════
@@ -769,17 +1173,89 @@ async def _ai_describe(thumb_path: str) -> str | None:
         return None
 
 
+async def _ai_caption_from_frame(thumb_path: str, num: int, total: int) -> str | None:
+    """FIX #30 — per-part captions now analyze that part's OWN thumbnail frame
+    via the vision model, instead of only guessing from the filename. Gives a
+    genuinely content-aware caption per part (e.g. reacts to what's actually
+    on screen at that timestamp) rather than a generic "Part N" filler line.
+    Returns None on any failure/timeout — caller falls back to the older,
+    filename-only _ai_caption(), and if that also fails, to a plain caption."""
+    if not AI_ENABLED:
+        return None
+    try:
+        with open(thumb_path, "rb") as f:
+            img_b64 = base64.b64encode(f.read()).decode()
+        resp = await asyncio.wait_for(
+            _groq_client.chat.completions.create(
+                model=GROQ_VISION_MODEL,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": (
+                            f"This is a frame from part {num} of {total} of a video. "
+                            f"Write ONE short, punchy Telegram caption (max 12 words, "
+                            f"1 emoji max) based on what's actually shown in this frame. "
+                            f"No hashtags, no quotes, just the caption text."
+                        )},
+                        {"type": "image_url",
+                         "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
+                    ],
+                }],
+                max_tokens=40,
+                temperature=0.8,
+            ),
+            timeout=AI_VISION_TIMEOUT,
+        )
+        text = resp.choices[0].message.content.strip().strip('"')
+        return text if text else None
+    except asyncio.TimeoutError:
+        log.warning(f"AI frame-caption timed out (part {num}/{total}).")
+        return None
+    except Exception as e:
+        log.warning(f"AI frame-caption failed (part {num}/{total}): {e} — falling back.")
+        return None
+
+
+# ══════════════════════════════════════════════════════════════
+#  INLINE KEYBOARDS — button-based UX (tap instead of type)
+# ══════════════════════════════════════════════════════════════
+def _quick_split_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✂️ 2 Parts", callback_data="qs:2"),
+         InlineKeyboardButton("✂️ 3 Parts", callback_data="qs:3"),
+         InlineKeyboardButton("✂️ 5 Parts", callback_data="qs:5")],
+        [InlineKeyboardButton("🔥 Best Clips (AI)", callback_data="qhighlights"),
+         InlineKeyboardButton("🎬 Scene Split", callback_data="qscene")],
+        [InlineKeyboardButton("🤖 Describe", callback_data="qdesc")],
+    ])
+
+def _merge_kb(count: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"✅ Done — Merge {count} Videos", callback_data="mdone")],
+        [InlineKeyboardButton("❌ Cancel Merge", callback_data="mcancel")],
+    ])
+
+
 # ══════════════════════════════════════════════════════════════
 #  SPLIT UI
 # ══════════════════════════════════════════════════════════════
-async def _split_update(msg, done: int, total: int, note: str = "") -> None:
+async def _split_update(msg, done: int, total: int, start_time: float,
+                        label: str, note: str = "") -> None:
     pct = (done * 100 // total) if total > 0 else 0
     note_line = f"\n  ┗ _{note}_" if note else ""
+    elapsed = time.time() - start_time
+    if done > 0:
+        avg = elapsed / done
+        time_line = (f"  🚄 **Speed** : `{avg:.1f}s/part`\n"
+                    f"  ⏱ **ETA** : `{_eta(avg * (total - done))}`  ·  ⏳ `{_eta(elapsed)}`\n")
+    else:
+        time_line = f"  ⏳ **Elapsed** : `{_eta(elapsed)}`\n"
     await _safe_edit(msg,
-        f"✂️ **Splitting…**\n"
+        f"✂️ **{label}**\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{_bar(pct, 16)} **{pct}%**\n"
         f"  Part **{done}** / **{total}** done{note_line}\n"
+        f"{time_line}"
         f"  ❌ /cancel to stop"
     )
 
@@ -815,9 +1291,16 @@ async def _upload_part(message, path: str, num: int, total: int,
     thumb = await make_thumb(path, thumb_time, thumb_path)
     uploaded = False
 
-    # AI caption — best effort, always falls back to plain caption on any issue
-    orig_name = os.path.basename(user_files.get(uid, "")) or "video"
-    ai_text = await _ai_caption(orig_name, num, total)
+    # AI caption — best effort, always falls back gracefully:
+    #   1) vision analysis of THIS part's actual thumbnail frame (best — content-aware)
+    #   2) filename-based text guess (if vision unavailable/failed)
+    #   3) plain "Part N / total" caption (if AI is off entirely)
+    ai_text = None
+    if thumb and os.path.exists(thumb_path):
+        ai_text = await _ai_caption_from_frame(thumb_path, num, total)
+    if not ai_text:
+        orig_name = os.path.basename(user_files.get(uid, "")) or "video"
+        ai_text = await _ai_caption(orig_name, num, total)
     base_caption = custom_caption or f"🎬 **Part {num} / {total}**"
     caption = f"{base_caption}\n_{ai_text}_" if ai_text else base_caption
 
@@ -907,6 +1390,7 @@ async def _run_split_segments(message, uid: int, segments: list[tuple[float, flo
     parts = len(segments)
     cancel = _get_cancel(uid)
     cancel.clear()
+    t0 = time.time()
     msg = await message.reply(
         f"✂️ **{label}**\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -921,7 +1405,7 @@ async def _run_split_segments(message, uid: int, segments: list[tuple[float, flo
                 _clear_status(uid)
                 return
             _set_status(uid, "Splitting", f"part {i+1}/{parts}")
-            await _split_update(msg, i, parts, f"cutting {i+1}/{parts}…")
+            await _split_update(msg, i, parts, t0, label, f"cutting {i+1}/{parts}…")
             out = f"{DOWNLOAD_DIR}/part_{uid}_{i+1}.mp4"
             ok  = await ffmpeg_cut(file, out, ss, seg)
             if not ok or not os.path.exists(out):
@@ -947,10 +1431,13 @@ async def _run_split_segments(message, uid: int, segments: list[tuple[float, flo
         except: pass
         user_files.pop(uid, None)
         _clear_status(uid)
+        total_elapsed = time.time() - t0
+        avg_part = total_elapsed / parts if parts else 0
         await _safe_edit(msg,
             f"🏁 **All {parts} parts done!**\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
             f"{_bar(100, 16)} **100%**\n"
+            f"  ⏱ Total: `{_eta(total_elapsed)}`  ·  🚄 avg `{avg_part:.1f}s`/part\n"
             f"  ✅ Complete — send next video!"
         )
         log.info(f"Split done uid={uid} parts={parts}")
@@ -991,7 +1478,7 @@ async def _do_split(message, uid: int, parts: int,
 COMMAND_LIST = [
     "start", "help", "split", "splitmin", "splitsize",
     "info",  "status", "cancel", "clear", "aistatus",
-    "trim", "extractaudio", "compress", "splitscene", "describe",
+    "trim", "extractaudio", "compress", "splitscene", "highlights", "describe",
     "mergestart", "mergedone", "mergecancel",
     "stats", "broadcast",
 ]
@@ -1005,13 +1492,14 @@ async def cmd_start(client, message):
     if await _dedup(message): return
     name = getattr(message.from_user, "first_name", "User") or "User"
     await message.reply(
-        f"⚡ **ULTRA BOT v4** — ready!\n\n"
+        f"⚡ **ULTRA BOT v6** — ready!\n\n"
         f"👋 Hey **{name}**!\n\n"
         f"📤 Send any **video**, then:\n"
         f"  • `/split 3`       — N equal parts\n"
         f"  • `/splitmin 2`    — chunk every N minutes\n"
         f"  • `/splitsize 500` — chunk every N MB\n"
-        f"  • `/splitscene`    — 🤖 AI scene-based split\n\n"
+        f"  • `/splitscene`    — split at every shot/cut (many small clips)\n"
+        f"  • `/highlights`    — 🔥 AI picks the 5-10 BEST moments (30-60s each)\n\n"
         f"🎛 **Video tools:**\n"
         f"  • `/trim 1:00 3:30` — extract a clip\n"
         f"  • `/compress medium` — shrink file size\n"
@@ -1029,14 +1517,18 @@ async def cmd_help(client, message):
     if await _dedup(message): return
     admin_line = "\n  `/stats` · `/broadcast msg` → admin only\n" if _is_admin(_uid(message) or -1) else ""
     await message.reply(
-        f"📖 **ULTRA BOT v4 — Help**\n\n"
+        f"📖 **ULTRA BOT v6 — Help**\n\n"
         f"**Step 1:** Koi bhi video send karo\n"
         f"  _(MP4, MKV, AVI, MOV, WEBM, WMV, 3GP)_\n\n"
         f"**Step 2:** Splitting:\n"
         f"  `/split N`       → N equal parts  |  `/split 3`\n"
         f"  `/splitmin N`    → N min chunks   |  `/splitmin 5`\n"
         f"  `/splitsize N`   → N MB chunks    |  `/splitsize 500`\n"
-        f"  `/splitscene`    → 🤖 auto-split at scene changes\n\n"
+        f"  `/splitscene`    → cuts at EVERY shot change (can be many tiny clips —\n"
+        f"                     good for precise editing, not for highlights)\n"
+        f"  `/highlights`    → 🔥 AI reads the dialogue and picks the 5-10 BEST,\n"
+        f"                     most shareable moments (30-60s each) — this is\n"
+        f"                     what you want for viral/highlight clips\n\n"
         f"**Video tools:**\n"
         f"  `/trim start end`   → clip a range  |  `/trim 1:00 3:30`\n"
         f"  `/compress level`   → low · medium · high\n"
@@ -1045,8 +1537,9 @@ async def cmd_help(client, message):
         f"  `/mergedone`        → merge the queued videos into one\n"
         f"  `/mergecancel`      → discard the merge queue\n\n"
         f"**AI:**\n"
-        f"  `/describe`  → AI description of the loaded video\n"
-        f"  `/aistatus`  → check if AI features are active\n\n"
+        f"  `/highlights` → best-moments auto-clipper (see above)\n"
+        f"  `/describe`   → AI description of the loaded video\n"
+        f"  `/aistatus`   → check if AI features are active\n\n"
         f"**Utils:**\n"
         f"  `/info`   → loaded video ki details\n"
         f"  `/status` → kya chal raha hai\n"
@@ -1113,7 +1606,7 @@ async def cmd_aistatus(client, message):
         await message.reply(
             f"🤖 **AI Captions: ON**\n"
             f"  Model: `{GROQ_MODEL}`\n"
-            f"  Each part gets an auto-generated caption.\n"
+            f"  Each part's thumbnail is analyzed → real content-aware caption.\n"
             f"  Falls back silently if AI is slow/unavailable."
         )
     else:
@@ -1230,10 +1723,15 @@ async def receive(client, message):
                 return
             user_merge_queue[uid].append(path)
             _track_video_processed()
+            listing = "\n".join(
+                f"  ✅ Video {i+1} — {_sz(os.path.getsize(p))}"
+                for i, p in enumerate(user_merge_queue[uid]) if os.path.exists(p)
+            )
             await _safe_edit(status,
-                f"✅ **Video #{idx} added to merge queue!**\n"
-                f"  📦 {_sz(os.path.getsize(path))}\n"
-                f"  👉 Aur bhejo, ya `/mergedone` se merge karo."
+                f"🔗 **Merge Queue ({idx} video{'s' if idx != 1 else ''})**\n"
+                f"{listing}\n\n"
+                f"👉 Aur bhejo, ya neeche tap karo:",
+                reply_markup=_merge_kb(idx),
             )
         return
 
@@ -1289,7 +1787,8 @@ async def receive(client, message):
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
             f"  📁 `{os.path.basename(path)}`\n"
             f"  📦 {_sz(os.path.getsize(path))}  ·  ⏱ {_eta(time.time()-t0)}\n\n"
-            f"👉 `/split N` · `/splitscene` · `/trim` · `/compress` · `/describe`"
+            f"👉 Neeche se ek tap karo, ya `/trim` · `/compress` · `/mergestart` type karo:",
+            reply_markup=_quick_split_kb(),
         )
 
 
@@ -1302,14 +1801,170 @@ def _is_ready(uid: int) -> bool:
     path = user_files.get(uid)
     return bool(path and os.path.exists(path))
 
+
+# ══════════════════════════════════════════════════════════════
+#  QUICK ACTIONS — shared logic for both /commands and button taps
+#  FIX #31 — extracted so inline-keyboard buttons (tap "2 Parts", "AI
+#  Scene Split", "Describe") can reuse the exact same validated path
+#  as the text commands, instead of duplicating the lock/ready checks.
+# ══════════════════════════════════════════════════════════════
+async def _quick_split(message, uid: int, parts: int) -> None:
+    lock = _get_lock(uid)
+    if lock.locked():
+        await message.reply("⏳ Already processing.\n👉 /status · /cancel")
+        return
+    if not _is_ready(uid):
+        await message.reply("❌ Pehle video bhejo!")
+        return
+    async with lock:
+        if not _is_ready(uid):
+            await message.reply("❌ File mil nahi rahi. Dobara bhejo!")
+            return
+        await _do_split(message, uid, parts,
+                        seg_override=None,
+                        label=f"Splitting into {parts} equal parts…")
+
+
+async def _quick_splitscene(message, uid: int) -> None:
+    lock = _get_lock(uid)
+    if lock.locked():
+        await message.reply("⏳ Already processing.\n👉 /status · /cancel")
+        return
+    if not _is_ready(uid):
+        await message.reply("❌ Pehle video bhejo!")
+        return
+    async with lock:
+        if not _is_ready(uid):
+            await message.reply("❌ File mil nahi rahi. Dobara bhejo!")
+            return
+        file = user_files[uid]
+        dur = await get_duration(file)
+        if not dur:
+            await message.reply("❌ Video duration nahi mila.")
+            return
+        scan_msg = await message.reply("🔍 **Scanning for scene changes…**")
+        cuts = await detect_scenes(file, uid, scan_msg, dur)
+        if not cuts:
+            await _safe_edit(scan_msg,
+                "❌ Koi clear scene change nahi mila.\n👉 `/split N` try karo instead.")
+            return
+        bounds = sorted(set([0.0] + [round(c, 2) for c in cuts if 0 < c < dur] + [dur]))
+        segments = [(bounds[i], bounds[i+1] - bounds[i])
+                    for i in range(len(bounds) - 1) if bounds[i+1] - bounds[i] > 0.5]
+        if len(segments) < 2:
+            await _safe_edit(scan_msg,
+                "❌ Sirf 1 scene mila — poora video ek jaisa hai.\n👉 `/split N` try karo.")
+            return
+        if len(segments) > 100:
+            segments = segments[:100]
+        await _safe_edit(scan_msg, f"🎬 **{len(segments)} scenes mile!** Splitting shuru ho raha hai…")
+        _track_video_processed()
+        await _run_split_segments(
+            message, uid, segments, f"{len(segments)} scenes — AI split…",
+            caption_fn=lambda i, t: f"🎬 **Scene {i} / {t}**",
+        )
+
+
+async def _quick_highlights(message, uid: int) -> None:
+    """/highlights — content-aware alternative to /splitscene. Transcribes
+    the dialogue and asks the LLM to pick 5-10 genuinely shareable moments
+    (30-60s each), instead of cutting at every visual shot change."""
+    lock = _get_lock(uid)
+    if lock.locked():
+        await message.reply("⏳ Already processing.\n👉 /status · /cancel")
+        return
+    if not _is_ready(uid):
+        await message.reply("❌ Pehle video bhejo!")
+        return
+    if not AI_ENABLED:
+        await message.reply("🤖 AI abhi off hai.\n👉 `/aistatus` check karo.")
+        return
+
+    async with lock:
+        if not _is_ready(uid):
+            await message.reply("❌ File mil nahi rahi. Dobara bhejo!")
+            return
+        file = user_files[uid]
+        dur = await get_duration(file)
+        if not dur:
+            await message.reply("❌ Video duration nahi mila.")
+            return
+
+        _get_cancel(uid).clear()
+        status = await message.reply(
+            "🎙 **Audio nikal rahe hain aur samajh rahe hain…**\n"
+            "  _(Pura dialogue analyze ho raha hai — thoda time lagega)_"
+        )
+        segments = await _transcribe_video(file, dur, uid, status)
+        if _get_cancel(uid).is_set():
+            await _safe_edit(status, "🚫 Cancelled.")
+            return
+        if not segments:
+            await _safe_edit(status,
+                "❌ Transcription fail ho gayi — audio na ho ya bahut lambi ho sakti hai.\n"
+                "👉 `/splitscene` try karo instead."
+            )
+            return
+
+        await _safe_edit(status,
+            f"🧠 **Best clips choose kar rahe hain…** ({len(segments)} dialogue segments mile)")
+        highlights = await _select_highlights(segments, dur)
+        if not highlights:
+            await _safe_edit(status,
+                "❌ Koi strong highlight nahi mila.\n👉 `/splitscene` ya `/split N` try karo.")
+            return
+
+        await _safe_edit(status, f"🔥 **{len(highlights)} best clips mile!** Cutting shuru…")
+        segs = [(h["start"], h["end"] - h["start"]) for h in highlights]
+        reasons = [h["reason"] for h in highlights]
+        _track_video_processed()
+        await _run_split_segments(
+            message, uid, segs, f"{len(highlights)} AI-picked highlights…",
+            caption_fn=lambda i, t: f"🔥 **Highlight {i} / {t}**\n_{reasons[i-1]}_",
+        )
+
+
+async def _quick_describe(message, uid: int) -> None:
+    lock = _get_lock(uid)
+    if lock.locked():
+        await message.reply("⏳ Already processing.\n👉 /status · /cancel")
+        return
+    if not _is_ready(uid):
+        await message.reply("❌ Pehle video bhejo!")
+        return
+    if not AI_ENABLED:
+        await message.reply("🤖 AI abhi off hai.\n👉 `/aistatus` check karo.")
+        return
+    async with lock:
+        if not _is_ready(uid):
+            await message.reply("❌ File mil nahi rahi. Dobara bhejo!")
+            return
+        file = user_files[uid]
+        status = await message.reply("🔍 **Analyzing video frame…**")
+        dur = await get_duration(file) or 0
+        mid_point = dur / 2 if dur else 1.0
+        thumb_path = f"{THUMB_DIR}/describe_{uid}.jpg"
+        thumb = await make_thumb(file, mid_point, thumb_path)
+        if not thumb:
+            await _safe_edit(status, "❌ Thumbnail nahi ban paya.")
+            return
+        desc = await _ai_describe(thumb_path)
+        try:
+            if os.path.exists(thumb_path): os.remove(thumb_path)
+        except: pass
+        if not desc:
+            await _safe_edit(status,
+                "❌ AI description generate nahi ho paayi.\n"
+                "  Vision model unavailable ho sakta hai — `GROQ_VISION_MODEL` env var check karo."
+            )
+            return
+        await _safe_edit(status, f"🤖 **AI Description:**\n_{desc}_")
+
 @app.on_message(filters.command("split"), group=1)
 async def cmd_split(client, message):
     if await _dedup(message): return
     uid = _uid(message)
     if uid is None: return
-    lock = _get_lock(uid)
-    if lock.locked():
-        return await message.reply("⏳ Already processing.\n👉 /status · /cancel")
     if not _is_ready(uid):
         return await message.reply("❌ Pehle video bhejo!")
     try:
@@ -1317,12 +1972,7 @@ async def cmd_split(client, message):
         assert 2 <= parts <= 100
     except:
         return await message.reply("❌ Usage: `/split 3`\n  Min 2, max 100.")
-    async with lock:
-        if not _is_ready(uid):
-            return await message.reply("❌ File mil nahi rahi. Dobara bhejo!")
-        await _do_split(message, uid, parts,
-                        seg_override=None,
-                        label=f"Splitting into {parts} equal parts…")
+    await _quick_split(message, uid, parts)
 
 @app.on_message(filters.command("splitmin"), group=1)
 async def cmd_splitmin(client, message):
@@ -1402,41 +2052,14 @@ async def cmd_splitscene(client, message):
     if await _dedup(message): return
     uid = _uid(message)
     if uid is None: return
-    lock = _get_lock(uid)
-    if lock.locked():
-        return await message.reply("⏳ Already processing.\n👉 /status · /cancel")
-    if not _is_ready(uid):
-        return await message.reply("❌ Pehle video bhejo!")
+    await _quick_splitscene(message, uid)
 
-    async with lock:
-        if not _is_ready(uid):
-            return await message.reply("❌ File mil nahi rahi. Dobara bhejo!")
-        file = user_files[uid]
-        dur = await get_duration(file)
-        if not dur:
-            return await message.reply("❌ Video duration nahi mila.")
-
-        scan_msg = await message.reply("🔍 **Scanning for scene changes…** (thoda time lagega)")
-        cuts = await detect_scenes(file)
-        if not cuts:
-            return await _safe_edit(scan_msg,
-                "❌ Koi clear scene change nahi mila.\n👉 `/split N` try karo instead.")
-
-        bounds = sorted(set([0.0] + [round(c, 2) for c in cuts if 0 < c < dur] + [dur]))
-        segments = [(bounds[i], bounds[i+1] - bounds[i])
-                    for i in range(len(bounds) - 1) if bounds[i+1] - bounds[i] > 0.5]
-        if len(segments) < 2:
-            return await _safe_edit(scan_msg,
-                "❌ Sirf 1 scene mila — poora video ek jaisa hai.\n👉 `/split N` try karo.")
-        if len(segments) > 100:
-            segments = segments[:100]
-
-        await _safe_edit(scan_msg, f"🎬 **{len(segments)} scenes mile!** Splitting shuru ho raha hai…")
-        _track_video_processed()
-        await _run_split_segments(
-            message, uid, segments, f"{len(segments)} scenes — AI split…",
-            caption_fn=lambda i, t: f"🎬 **Scene {i} / {t}**",
-        )
+@app.on_message(filters.command("highlights"), group=1)
+async def cmd_highlights(client, message):
+    if await _dedup(message): return
+    uid = _uid(message)
+    if uid is None: return
+    await _quick_highlights(message, uid)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1523,8 +2146,10 @@ async def cmd_compress(client, message):
         _set_status(uid, "Compressing", level)
         msg = await message.reply(f"🗜 **Compressing** (`{level}`)…")
 
+        t0 = time.time()
         out = f"{DOWNLOAD_DIR}/compressed_{uid}_{message.id}.mp4"
         ok = await ffmpeg_compress(file, out, crf, uid, msg)
+        elapsed = time.time() - t0
 
         if _get_cancel(uid).is_set():
             _clear_status(uid)
@@ -1546,9 +2171,14 @@ async def cmd_compress(client, message):
         user_files[uid] = out
         _clear_status(uid)
         saved_pct = (1 - new_size / orig_size) * 100 if orig_size else 0
+        reaction = ("🤯 **Massive shrink!**" if saved_pct >= 60 else
+                    "🔥 **Great compression!**" if saved_pct >= 35 else
+                    "👍 **Nicely trimmed down!**" if saved_pct >= 10 else
+                    "✅ **Done!** _(already fairly optimized)_")
         await _safe_edit(msg,
-            f"✅ **Compressed!**\n"
+            f"{reaction}\n"
             f"  📦 `{_sz(orig_size)}` → `{_sz(new_size)}`  ({saved_pct:.0f}% smaller)\n"
+            f"  ⏱ Took `{_eta(elapsed)}`\n"
             f"  👉 `/split N` ab is compressed file pe chalega."
         )
 
@@ -1593,7 +2223,100 @@ async def cmd_extract_audio(client, message):
 
 # ══════════════════════════════════════════════════════════════
 #  MERGE — collect multiple videos, join into one
+#  FIX #31 — core logic extracted into _merge_finish/_merge_abort so
+#  the inline "✅ Done" / "❌ Cancel" buttons can trigger the exact
+#  same path as /mergedone and /mergecancel, not a re-implementation.
 # ══════════════════════════════════════════════════════════════
+async def _merge_abort(uid: int, reply_target) -> bool:
+    """Returns True if a queue was actually found & cancelled."""
+    queue = user_merge_queue.pop(uid, None)
+    if queue is None:
+        await reply_target.reply("💤 Koi merge queue active nahi hai.")
+        return False
+    for p in queue:
+        try:
+            if os.path.exists(p): os.remove(p)
+        except: pass
+    await reply_target.reply(f"🚫 Merge queue cancelled. {len(queue)} video(s) discarded.")
+    return True
+
+
+async def _merge_finish(uid: int, reply_target) -> None:
+    lock = _get_lock(uid)
+    if lock.locked():
+        await reply_target.reply("⏳ Already processing.\n👉 /status · /cancel")
+        return
+    queue = user_merge_queue.get(uid)
+    if not queue:
+        await reply_target.reply("❌ Merge queue khaali hai.\n👉 Pehle `/mergestart` karo, phir videos bhejo.")
+        return
+    if len(queue) < 2:
+        await reply_target.reply(f"❌ Kam se kam 2 videos chahiye (abhi {len(queue)}).\n👉 Aur bhejo ya `/mergecancel`.")
+        return
+
+    async with lock:
+        files = user_merge_queue.pop(uid, [])
+        if len(files) < 2:
+            for p in files:  # race guard — queue changed before lock acquired
+                try:
+                    if os.path.exists(p): os.remove(p)
+                except: pass
+            await reply_target.reply("❌ Merge queue khaali ho gaya. Dobara `/mergestart` karo.")
+            return
+
+        _get_cancel(uid).clear()
+        _set_status(uid, "Merging", f"{len(files)} videos")
+        msg = await reply_target.reply(f"🔗 **Merging {len(files)} videos…**")
+
+        # Combined source duration, just for the celebration message below —
+        # ffmpeg_merge now probes durations itself (in parallel) for its OWN
+        # live progress bar, so this is a separate, cheap, parallel lookup.
+        durations = await asyncio.gather(*(get_duration(p) for p in files))
+        combined_dur = sum(durations) if all(durations) else 0.0
+
+        t0 = time.time()
+        out = f"{DOWNLOAD_DIR}/merged_{uid}_{int(time.time()*1000)}.mp4"
+        ok = await ffmpeg_merge(files, out, uid, msg)
+        elapsed = time.time() - t0
+
+        for p in files:
+            try:
+                if os.path.exists(p): os.remove(p)
+            except: pass
+
+        if _get_cancel(uid).is_set():
+            _clear_status(uid)
+            try:
+                if os.path.exists(out): os.remove(out)
+            except: pass
+            await _safe_edit(msg, "🚫 Merge cancelled.")
+            return
+
+        if not ok or not os.path.exists(out):
+            _clear_status(uid)
+            try:
+                if os.path.exists(out): os.remove(out)
+            except: pass
+            await _safe_edit(msg, "❌ Merge failed. Videos ka codec/format bahut alag ho sakta hai.")
+            return
+
+        old = user_files.pop(uid, None)
+        if old and os.path.exists(old):
+            try: os.remove(old)
+            except: pass
+        user_files[uid] = out
+        _clear_status(uid)
+        _track_video_processed()
+        await _safe_edit(msg,
+            f"🎉 **{len(files)} videos merged into 1!**\n"
+            f"  📦 `{_sz(os.path.getsize(out))}`"
+            f"{f'  ·  🎞 `{_eta(combined_dur)}` total' if combined_dur else ''}\n"
+            f"  ⏱ Took `{_eta(elapsed)}`\n"
+            f"  👉 Neeche se quick split karo, ya `/split N` type karo:",
+            reply_markup=_quick_split_kb(),
+        )
+
+
 @app.on_message(filters.command("mergestart"), group=1)
 async def cmd_merge_start(client, message):
     if await _dedup(message): return
@@ -1611,8 +2334,7 @@ async def cmd_merge_start(client, message):
     await message.reply(
         "🔗 **Merge mode ON!**\n"
         f"Ab jitni videos merge karni hain bhejo (max {MAX_MERGE_VIDEOS}, order maintain hoga).\n"
-        "Khatam hone par `/mergedone` bhejo.\n"
-        "Cancel karne ke liye `/mergecancel`."
+        "Jab bhej chuko, neeche button se ✅ Done tap karo (ya `/mergedone` type karo)."
     )
 
 @app.on_message(filters.command("mergecancel"), group=1)
@@ -1620,76 +2342,14 @@ async def cmd_merge_cancel(client, message):
     if await _dedup(message): return
     uid = _uid(message)
     if uid is None: return
-    queue = user_merge_queue.pop(uid, None)
-    if queue is None:
-        return await message.reply("💤 Koi merge queue active nahi hai.")
-    for p in queue:
-        try:
-            if os.path.exists(p): os.remove(p)
-        except: pass
-    await message.reply(f"🚫 Merge queue cancelled. {len(queue)} video(s) discarded.")
+    await _merge_abort(uid, message)
 
 @app.on_message(filters.command("mergedone"), group=1)
 async def cmd_merge_done(client, message):
     if await _dedup(message): return
     uid = _uid(message)
     if uid is None: return
-    lock = _get_lock(uid)
-    if lock.locked():
-        return await message.reply("⏳ Already processing.\n👉 /status · /cancel")
-    queue = user_merge_queue.get(uid)
-    if not queue:
-        return await message.reply("❌ Merge queue khaali hai.\n👉 Pehle `/mergestart` karo, phir videos bhejo.")
-    if len(queue) < 2:
-        return await message.reply(f"❌ Kam se kam 2 videos chahiye (abhi {len(queue)}).\n👉 Aur bhejo ya `/mergecancel`.")
-
-    async with lock:
-        files = user_merge_queue.pop(uid, [])
-        if len(files) < 2:
-            for p in files:  # race guard — queue changed before lock acquired
-                try:
-                    if os.path.exists(p): os.remove(p)
-                except: pass
-            return await message.reply("❌ Merge queue khaali ho gaya. Dobara `/mergestart` karo.")
-
-        _get_cancel(uid).clear()
-        _set_status(uid, "Merging", f"{len(files)} videos")
-        msg = await message.reply(f"🔗 **Merging {len(files)} videos…**")
-
-        out = f"{DOWNLOAD_DIR}/merged_{uid}_{message.id}.mp4"
-        ok = await ffmpeg_merge(files, out, uid, msg)
-
-        for p in files:
-            try:
-                if os.path.exists(p): os.remove(p)
-            except: pass
-
-        if _get_cancel(uid).is_set():
-            _clear_status(uid)
-            try:
-                if os.path.exists(out): os.remove(out)
-            except: pass
-            return await _safe_edit(msg, "🚫 Merge cancelled.")
-
-        if not ok or not os.path.exists(out):
-            _clear_status(uid)
-            try:
-                if os.path.exists(out): os.remove(out)
-            except: pass
-            return await _safe_edit(msg, "❌ Merge failed. Videos ka codec/format bahut alag ho sakta hai.")
-
-        old = user_files.pop(uid, None)
-        if old and os.path.exists(old):
-            try: os.remove(old)
-            except: pass
-        user_files[uid] = out
-        _clear_status(uid)
-        _track_video_processed()
-        await _safe_edit(msg,
-            f"✅ **Merged into 1 file!**\n"
-            f"  📦 `{_sz(os.path.getsize(out))}`\n"
-            f"  👉 `/split N` ya seedha aage process karo."
-        )
+    await _merge_finish(uid, message)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1700,38 +2360,7 @@ async def cmd_describe(client, message):
     if await _dedup(message): return
     uid = _uid(message)
     if uid is None: return
-    lock = _get_lock(uid)
-    if lock.locked():
-        return await message.reply("⏳ Already processing.\n👉 /status · /cancel")
-    if not _is_ready(uid):
-        return await message.reply("❌ Pehle video bhejo!")
-    if not AI_ENABLED:
-        return await message.reply("🤖 AI abhi off hai.\n👉 `/aistatus` check karo.")
-
-    async with lock:
-        if not _is_ready(uid):
-            return await message.reply("❌ File mil nahi rahi. Dobara bhejo!")
-        file = user_files[uid]
-        status = await message.reply("🔍 **Analyzing video frame…**")
-        dur = await get_duration(file) or 0
-        mid_point = dur / 2 if dur else 1.0
-
-        thumb_path = f"{THUMB_DIR}/describe_{uid}.jpg"
-        thumb = await make_thumb(file, mid_point, thumb_path)
-        if not thumb:
-            return await _safe_edit(status, "❌ Thumbnail nahi ban paya.")
-
-        desc = await _ai_describe(thumb_path)
-        try:
-            if os.path.exists(thumb_path): os.remove(thumb_path)
-        except: pass
-
-        if not desc:
-            return await _safe_edit(status,
-                "❌ AI description generate nahi ho paayi.\n"
-                "  Vision model unavailable ho sakta hai — `GROQ_VISION_MODEL` env var check karo."
-            )
-        await _safe_edit(status, f"🤖 **AI Description:**\n_{desc}_")
+    await _quick_describe(message, uid)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1794,6 +2423,62 @@ async def cmd_broadcast(client, message):
 
 
 # ══════════════════════════════════════════════════════════════
+#  CALLBACK QUERIES — inline button taps
+#  Every handler answers the callback immediately (required by
+#  Telegram, dismisses the button's loading spinner) before doing
+#  any real work, then routes to the exact same shared logic the
+#  text commands use — no separate/duplicated code paths.
+# ══════════════════════════════════════════════════════════════
+@app.on_callback_query(filters.regex(r"^qs:\d+$"))
+async def cb_quick_split(client, callback_query):
+    await callback_query.answer()
+    uid = callback_query.from_user.id if callback_query.from_user else None
+    if uid is None: return
+    _stats_users_seen.add(uid)
+    parts = int(callback_query.data.split(":")[1])
+    await _quick_split(callback_query.message, uid, parts)
+
+@app.on_callback_query(filters.regex(r"^qscene$"))
+async def cb_quick_scene(client, callback_query):
+    await callback_query.answer()
+    uid = callback_query.from_user.id if callback_query.from_user else None
+    if uid is None: return
+    _stats_users_seen.add(uid)
+    await _quick_splitscene(callback_query.message, uid)
+
+@app.on_callback_query(filters.regex(r"^qhighlights$"))
+async def cb_quick_highlights(client, callback_query):
+    await callback_query.answer()
+    uid = callback_query.from_user.id if callback_query.from_user else None
+    if uid is None: return
+    _stats_users_seen.add(uid)
+    await _quick_highlights(callback_query.message, uid)
+
+@app.on_callback_query(filters.regex(r"^qdesc$"))
+async def cb_quick_describe(client, callback_query):
+    await callback_query.answer()
+    uid = callback_query.from_user.id if callback_query.from_user else None
+    if uid is None: return
+    _stats_users_seen.add(uid)
+    await _quick_describe(callback_query.message, uid)
+
+@app.on_callback_query(filters.regex(r"^mdone$"))
+async def cb_merge_done(client, callback_query):
+    await callback_query.answer()
+    uid = callback_query.from_user.id if callback_query.from_user else None
+    if uid is None: return
+    _stats_users_seen.add(uid)
+    await _merge_finish(uid, callback_query.message)
+
+@app.on_callback_query(filters.regex(r"^mcancel$"))
+async def cb_merge_cancel(client, callback_query):
+    await callback_query.answer()
+    uid = callback_query.from_user.id if callback_query.from_user else None
+    if uid is None: return
+    await _merge_abort(uid, callback_query.message)
+
+
+# ══════════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    log.info("🚀 Ultra Bot v4 starting…")
+    log.info("🚀 Ultra Bot v6 starting…")
     app.run()
