@@ -2479,6 +2479,29 @@ async def cb_merge_cancel(client, callback_query):
 
 
 # ══════════════════════════════════════════════════════════════
+def _start_dummy_webserver():
+    """Render free 'Web Service' expects an open port. This bot is a
+    background process (Telegram polling via Pyrogram), so it never binds
+    a port on its own — Render's port scan times out and kills the deploy.
+    This starts a tiny Flask server on $PORT just to satisfy that scan.
+    (Not needed if you switch the Render service type to Background Worker.)"""
+    from flask import Flask
+    import threading
+
+    web = Flask(__name__)
+
+    @web.route("/")
+    def home():
+        return "Bot is running", 200
+
+    def run():
+        port = int(os.environ.get("PORT", 10000))
+        web.run(host="0.0.0.0", port=port)
+
+    threading.Thread(target=run, daemon=True).start()
+
+
 if __name__ == "__main__":
     log.info("🚀 Ultra Bot v6 starting…")
+    _start_dummy_webserver()
     app.run()
