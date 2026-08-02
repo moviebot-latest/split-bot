@@ -108,11 +108,8 @@ FFMPEG_CUT_TIMEOUT  = 600              # 10 min per segment
 FFPROBE_TIMEOUT     = 30              # 30 s for duration probe
 THUMB_TIMEOUT       = 15              # 15 s for thumbnail
 MIN_PART_BYTES      = 1024            # FIX #21 — reject parts smaller than 1 KB
-DOWNLOAD_TOTAL_TIMEOUT  = 1800         # 30 min hard cap on a single download — absolute backstop
-DOWNLOAD_IDLE_TIMEOUT   = 180          # FIX #35 — 3 min with NO new bytes = treat as a dead/stalled
-                                        # connection and abort now, instead of waiting out the full
-                                        # 30-min total cap. This is what actually catches the
-                                        # "frozen progress bar for 50+ minutes" case.
+# NOTE: download idle/total timeouts removed per user request —
+# downloads now run for as long as they take, with no timeout of any kind.
 FFMPEG_MERGE_TIMEOUT    = 900          # 15 min for merge
 FFMPEG_COMPRESS_TIMEOUT = 1800         # 30 min for re-encode/compress
 FFMPEG_AUDIO_TIMEOUT    = 300          # 5 min for audio extraction
@@ -399,9 +396,18 @@ async def progress(current, total, msg, start, uid: int = 0,
     if not isinstance(total, (int, float)) or total <= 0: return
     now     = time.time()
     elapsed = max(now - start, 0.001)
-    if now - _last_edit.get(uid, 0.0) < THROTTLE and _last_edit.get(uid, 0.0) != 0.0:
-        return
+    # FIX — liveness signal (used by the idle watchdog) must update on
+    # EVERY progress() call, not only when we actually edit the message.
+    # Previously this line ran only after the throttle check below, so
+    # on large (2GB+) files any callback that landed inside the 0.5s
+    # UI-throttle window never refreshed _last_edit — bytes were still
+    # flowing but the watchdog saw a stale timestamp and eventually
+    # misfired a false "stalled" abort. Splitting the two concerns
+    # fixes it: liveness updates unconditionally, UI-edit stays throttled.
+    prev_edit = _last_edit.get(uid, 0.0)
     _last_edit[uid] = now
+    if now - prev_edit < THROTTLE and prev_edit != 0.0:
+        return
     raw   = current / elapsed
     ema   = EMA_ALPHA * raw + (1 - EMA_ALPHA) * _ema_speed.get(uid, raw)
     _ema_speed[uid] = ema
@@ -435,40 +441,20 @@ async def upload_progress(current, total, msg, start, uid: int = 0) -> None:
 #  there frozen for the remaining ~28 min with nothing watching it, which
 #  is exactly the "same %, same elapsed time, for 50+ minutes" freeze
 #  reported (and stale files/stuck locks piled up the same way).
-#  This wraps a download in TWO independent checks polled every 5s:
-#    - idle_timeout  : no progress() call (no bytes moving) this long
-#                      -> connection is dead, abort now
-#    - total_timeout : absolute cap regardless of activity (unchanged)
+#
+#  UPDATE (user request) — both the idle-stall check and the absolute
+#  30-min cap have been removed entirely. Downloads now run for as long
+#  as they take, with no timeout of any kind. Note: a genuinely dead
+#  connection will now hang forever (holding the user's lock) since
+#  nothing aborts it anymore — this is the tradeoff of "unlimited time".
 # ══════════════════════════════════════════════════════════════
 class _DownloadStalled(Exception):
+    """No longer raised anywhere — kept only so any stray references don't break."""
     pass
 
-async def _await_with_watchdog(coro, uid: int, *,
-                               total_timeout: float = DOWNLOAD_TOTAL_TIMEOUT,
-                               idle_timeout: float = DOWNLOAD_IDLE_TIMEOUT):
-    start = time.time()
-    _last_edit[uid] = start  # explicit fresh baseline — don't inherit a stale timestamp
-    task = asyncio.ensure_future(coro)
-    try:
-        while not task.done():
-            await asyncio.wait({task}, timeout=5)
-            if task.done():
-                break
-            now = time.time()
-            if now - start > total_timeout:
-                task.cancel()
-                try: await task
-                except (Exception, asyncio.CancelledError): pass
-                raise asyncio.TimeoutError()
-            if now - _last_edit.get(uid, start) > idle_timeout:
-                task.cancel()
-                try: await task
-                except (Exception, asyncio.CancelledError): pass
-                raise _DownloadStalled()
-        return task.result()
-    finally:
-        if not task.done():
-            task.cancel()
+async def _await_with_watchdog(coro, uid: int):
+    # No timeout logic — just run the download to completion, however long it takes.
+    return await coro
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1793,20 +1779,10 @@ async def receive(client, message):
                 except: pass
                 await _safe_edit(status, "🚫 **Download cancelled.**")
                 return
-            except _DownloadStalled:
-                try:
-                    if os.path.exists(fname_m): os.remove(fname_m)
-                except: pass
-                await _safe_edit(status,
-                    f"❌ **Download stalled** — {DOWNLOAD_IDLE_TIMEOUT // 60} min tak koi data nahi aaya. Phir try karo.")
-                return
-            except asyncio.TimeoutError:
-                try:
-                    if os.path.exists(fname_m): os.remove(fname_m)
-                except: pass
-                await _safe_edit(status, "❌ Download timed out (30 min).")
-                return
             except Exception as e:
+                try:
+                    if os.path.exists(fname_m): os.remove(fname_m)
+                except: pass
                 await _safe_edit(status, f"❌ Download failed: `{e}`")
                 return
             if not path or not os.path.exists(path):
@@ -1868,19 +1844,6 @@ async def receive(client, message):
                 if os.path.exists(fname): os.remove(fname)
             except: pass
             await _safe_edit(status, "🚫 **Download cancelled.**")
-            return
-        except _DownloadStalled:
-            _clear_status(uid)
-            try:
-                if os.path.exists(fname): os.remove(fname)
-            except: pass
-            await _safe_edit(status,
-                f"❌ **Download stalled** — {DOWNLOAD_IDLE_TIMEOUT // 60} min tak koi data nahi aaya.\n"
-                f"Connection dead ho gaya lagta hai. Phir se bhejo!")
-            return
-        except asyncio.TimeoutError:
-            _clear_status(uid)
-            await _safe_edit(status, "❌ Download timed out (30 min) — connection stalled. `/clear` karke phir try karo.")
             return
         except Exception as e:
             _clear_status(uid)
