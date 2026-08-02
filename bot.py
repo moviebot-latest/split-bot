@@ -108,6 +108,11 @@ FFMPEG_CUT_TIMEOUT  = 600              # 10 min per segment
 FFPROBE_TIMEOUT     = 30              # 30 s for duration probe
 THUMB_TIMEOUT       = 15              # 15 s for thumbnail
 MIN_PART_BYTES      = 1024            # FIX #21 — reject parts smaller than 1 KB
+DOWNLOAD_TOTAL_TIMEOUT  = 1800         # 30 min hard cap on a single download — absolute backstop
+DOWNLOAD_IDLE_TIMEOUT   = 180          # FIX #35 — 3 min with NO new bytes = treat as a dead/stalled
+                                        # connection and abort now, instead of waiting out the full
+                                        # 30-min total cap. This is what actually catches the
+                                        # "frozen progress bar for 50+ minutes" case.
 FFMPEG_MERGE_TIMEOUT    = 900          # 15 min for merge
 FFMPEG_COMPRESS_TIMEOUT = 1800         # 30 min for re-encode/compress
 FFMPEG_AUDIO_TIMEOUT    = 300          # 5 min for audio extraction
@@ -300,7 +305,22 @@ async def _dedup(message) -> bool:
 
 # ══════════════════════════════════════════════════════════════
 #  PROGRESS ENGINE
+#  FIX #34 — /cancel didn't actually stop an in-flight download/upload.
+#  Root cause: progress() only checked the cancel Event to skip editing
+#  the status message; the underlying message.download()/reply_video()
+#  call from Pyrogram kept running regardless, since nothing ever told
+#  it to stop. Result: user taps /cancel -> "Stopping at next
+#  checkpoint..." -> nothing happens (no checkpoint exists inside a
+#  single download) -> lock stays held -> /clear also refuses ("finish
+#  /cancel first") -> user is stuck for up to the 30 min hard timeout.
+#  FIX: raise _UserCancelled from inside progress(); Pyrogram calls this
+#  callback synchronously from within its own chunk-read loop, so a
+#  raised exception propagates straight out of .download()/.reply_video()
+#  and aborts the transfer immediately instead of only skipping the UI.
 # ══════════════════════════════════════════════════════════════
+class _UserCancelled(Exception):
+    pass
+
 THROTTLE  = 0.5
 EMA_ALPHA = 0.35
 SPINNER   = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"]
@@ -374,8 +394,9 @@ async def _safe_edit(msg, text: str, reply_markup=None) -> None:
 
 async def progress(current, total, msg, start, uid: int = 0,
                    mode: str = "📥 Download") -> None:
+    if _get_cancel(uid).is_set():
+        raise _UserCancelled()
     if not isinstance(total, (int, float)) or total <= 0: return
-    if _get_cancel(uid).is_set(): return
     now     = time.time()
     elapsed = max(now - start, 0.001)
     if now - _last_edit.get(uid, 0.0) < THROTTLE and _last_edit.get(uid, 0.0) != 0.0:
@@ -405,6 +426,49 @@ async def progress(current, total, msg, start, uid: int = 0,
 
 async def upload_progress(current, total, msg, start, uid: int = 0) -> None:
     await progress(current, total, msg, start, uid=uid, mode="⬆️ Upload")
+
+
+# ══════════════════════════════════════════════════════════════
+#  FIX #35 — IDLE WATCHDOG for downloads
+#  The OLD 30-min asyncio.wait_for() only caught a stall once the WHOLE
+#  operation had run 30 min — a connection that dies 2 min in still sat
+#  there frozen for the remaining ~28 min with nothing watching it, which
+#  is exactly the "same %, same elapsed time, for 50+ minutes" freeze
+#  reported (and stale files/stuck locks piled up the same way).
+#  This wraps a download in TWO independent checks polled every 5s:
+#    - idle_timeout  : no progress() call (no bytes moving) this long
+#                      -> connection is dead, abort now
+#    - total_timeout : absolute cap regardless of activity (unchanged)
+# ══════════════════════════════════════════════════════════════
+class _DownloadStalled(Exception):
+    pass
+
+async def _await_with_watchdog(coro, uid: int, *,
+                               total_timeout: float = DOWNLOAD_TOTAL_TIMEOUT,
+                               idle_timeout: float = DOWNLOAD_IDLE_TIMEOUT):
+    start = time.time()
+    _last_edit[uid] = start  # explicit fresh baseline — don't inherit a stale timestamp
+    task = asyncio.ensure_future(coro)
+    try:
+        while not task.done():
+            await asyncio.wait({task}, timeout=5)
+            if task.done():
+                break
+            now = time.time()
+            if now - start > total_timeout:
+                task.cancel()
+                try: await task
+                except (Exception, asyncio.CancelledError): pass
+                raise asyncio.TimeoutError()
+            if now - _last_edit.get(uid, start) > idle_timeout:
+                task.cancel()
+                try: await task
+                except (Exception, asyncio.CancelledError): pass
+                raise _DownloadStalled()
+        return task.result()
+    finally:
+        if not task.done():
+            task.cancel()
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1330,6 +1394,10 @@ async def _upload_part(message, path: str, num: int, total: int,
             _track_part_created()
             break  # ✅ NEVER retry after success — prevents double upload
 
+        except _UserCancelled:
+            await _safe_edit(status, "🚫 Upload cancelled.")
+            break
+
         except FloodWait as e:
             # Safe to retry: FloodWait means Telegram rejected before storing
             wait = e.value + 2
@@ -1628,7 +1696,7 @@ async def cmd_cancel(client, message):
     await message.reply("🚫 **Cancel requested!**\nStopping at next checkpoint…")
 
 @app.on_message(filters.command("clear"), group=1)
-async def cmd_clear(message):
+async def cmd_clear(client, message):
     """Reset stuck user state without bot restart."""
     if await _dedup(message): return
     uid = _uid(message)
@@ -1650,7 +1718,7 @@ async def cmd_clear(message):
             except: pass
     _get_cancel(uid).clear()
     _clear_status(uid)
-    _reset(uid)
+    user_locks.pop(uid, None)
     await message.reply(
         "🗑️ **State cleared!**\n"
         "Sab kuch reset ho gaya.\n"
@@ -1708,13 +1776,36 @@ async def receive(client, message):
             idx = len(user_merge_queue[uid]) + 1
             fname_m = f"{DOWNLOAD_DIR}/merge_{uid}_{idx}_{message.id}.{ext}"
             status = await message.reply(f"📥 **Downloading video #{idx} for merge…** {sz_str}")
+            _reset(uid)  # fresh progress baseline — don't inherit stale speed/timing from a prior op
             t0 = time.time()
             try:
-                path = await message.download(
-                    file_name=fname_m,
-                    progress=progress,
-                    progress_args=(status, t0, uid, f"📥 Merge #{idx}"),
+                path = await _await_with_watchdog(
+                    message.download(
+                        file_name=fname_m,
+                        progress=progress,
+                        progress_args=(status, t0, uid, f"📥 Merge #{idx}"),
+                    ),
+                    uid,
                 )
+            except _UserCancelled:
+                try:
+                    if os.path.exists(fname_m): os.remove(fname_m)
+                except: pass
+                await _safe_edit(status, "🚫 **Download cancelled.**")
+                return
+            except _DownloadStalled:
+                try:
+                    if os.path.exists(fname_m): os.remove(fname_m)
+                except: pass
+                await _safe_edit(status,
+                    f"❌ **Download stalled** — {DOWNLOAD_IDLE_TIMEOUT // 60} min tak koi data nahi aaya. Phir try karo.")
+                return
+            except asyncio.TimeoutError:
+                try:
+                    if os.path.exists(fname_m): os.remove(fname_m)
+                except: pass
+                await _safe_edit(status, "❌ Download timed out (30 min).")
+                return
             except Exception as e:
                 await _safe_edit(status, f"❌ Download failed: `{e}`")
                 return
@@ -1763,11 +1854,34 @@ async def receive(client, message):
         t0 = time.time()
 
         try:
-            path = await message.download(
-                file_name=fname,
-                progress=progress,
-                progress_args=(status, t0, uid, "📥 Download"),
+            path = await _await_with_watchdog(
+                message.download(
+                    file_name=fname,
+                    progress=progress,
+                    progress_args=(status, t0, uid, "📥 Download"),
+                ),
+                uid,
             )
+        except _UserCancelled:
+            _clear_status(uid)
+            try:
+                if os.path.exists(fname): os.remove(fname)
+            except: pass
+            await _safe_edit(status, "🚫 **Download cancelled.**")
+            return
+        except _DownloadStalled:
+            _clear_status(uid)
+            try:
+                if os.path.exists(fname): os.remove(fname)
+            except: pass
+            await _safe_edit(status,
+                f"❌ **Download stalled** — {DOWNLOAD_IDLE_TIMEOUT // 60} min tak koi data nahi aaya.\n"
+                f"Connection dead ho gaya lagta hai. Phir se bhejo!")
+            return
+        except asyncio.TimeoutError:
+            _clear_status(uid)
+            await _safe_edit(status, "❌ Download timed out (30 min) — connection stalled. `/clear` karke phir try karo.")
+            return
         except Exception as e:
             _clear_status(uid)
             await _safe_edit(status, f"❌ Download failed: `{e}`")
