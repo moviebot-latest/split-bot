@@ -1,4 +1,4 @@
-# Ultra Bot v6.0 — FIX #32/#33: Live %/speed/ETA progress engine extended to
+# Ultra Bot v10.0 — scene/highlight engine upgrade + FIX #32/#33: Live %/speed/ETA progress engine extended to
 # compress, merge, scene-detect, split & trim (previously download/upload only)
 import os
 import sys
@@ -11,6 +11,10 @@ import base64
 import asyncio
 import logging
 import traceback
+import shutil
+import random
+import sqlite3
+import uuid
 from collections import deque
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -99,6 +103,113 @@ def _is_admin(uid: int) -> bool:
 
 
 # ══════════════════════════════════════════════════════════════
+#  V10 — PERSISTENT JOB RECOVERY
+#  Uses Postgres/Neon when DATABASE_URL is configured. Falls back to
+#  SQLite for local development. Render Free needs DATABASE_URL/Neon
+#  for restart-safe recovery because its local filesystem is ephemeral.
+# ══════════════════════════════════════════════════════════════
+RECOVERY_DB_URL = (os.getenv("DATABASE_URL", "") or os.getenv("NEON_DATABASE_URL", "")).strip()
+RECOVERY_DB_PATH = os.getenv("RECOVERY_DB_PATH", "recovery_jobs.sqlite3")
+
+try:
+    import psycopg2
+    _HAS_PG = True
+except ImportError:
+    psycopg2 = None
+    _HAS_PG = False
+
+_DB_LOCK = asyncio.Lock()
+
+def _db_conn():
+    if RECOVERY_DB_URL and _HAS_PG:
+        return psycopg2.connect(RECOVERY_DB_URL, connect_timeout=10)
+    conn = sqlite3.connect(RECOVERY_DB_PATH, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
+    return conn
+
+def _db_init_sync():
+    conn = _db_conn()
+    try:
+        cur = conn.cursor()
+        if RECOVERY_DB_URL and _HAS_PG:
+            cur.execute("""CREATE TABLE IF NOT EXISTS video_jobs (
+                job_id TEXT PRIMARY KEY, uid BIGINT NOT NULL, chat_id BIGINT NOT NULL,
+                source_message_id BIGINT NOT NULL, kind TEXT NOT NULL, state TEXT NOT NULL,
+                payload TEXT NOT NULL, source_path TEXT, attempts INTEGER NOT NULL DEFAULT 0,
+                created_at DOUBLE PRECISION NOT NULL, updated_at DOUBLE PRECISION NOT NULL
+            )""")
+        else:
+            cur.execute("""CREATE TABLE IF NOT EXISTS video_jobs (
+                job_id TEXT PRIMARY KEY, uid INTEGER NOT NULL, chat_id INTEGER NOT NULL,
+                source_message_id INTEGER NOT NULL, kind TEXT NOT NULL, state TEXT NOT NULL,
+                payload TEXT NOT NULL, source_path TEXT, attempts INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL, updated_at REAL NOT NULL
+            )""")
+        conn.commit()
+    finally:
+        conn.close()
+
+def _db_exec_sync(sql, params=(), fetch=False, many=False):
+    conn=_db_conn()
+    try:
+        if not (RECOVERY_DB_URL and _HAS_PG):
+            sql=sql.replace("%s", "?")
+        cur=conn.cursor()
+        if many: cur.executemany(sql, params)
+        else: cur.execute(sql, params)
+        rows=cur.fetchall() if fetch else None
+        conn.commit()
+        return rows
+    finally: conn.close()
+
+def _db_exec_sqlite_safe(sql, params=(), fetch=False):
+    # Convert PostgreSQL placeholders to SQLite placeholders; schema syntax used above is compatible.
+    sql2=sql.replace("%s", "?")
+    return _db_exec_sync(sql2, params, fetch=fetch)
+
+async def _db_init():
+    await asyncio.to_thread(_db_init_sync)
+
+async def _job_create(uid, chat_id, source_message_id, kind, payload, source_path=None, job_id=None):
+    job_id = job_id or uuid.uuid4().hex[:16]
+    now=time.time()
+    await asyncio.to_thread(_db_exec_sync,
+        "INSERT INTO video_jobs(job_id,uid,chat_id,source_message_id,kind,state,payload,source_path,attempts,created_at,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+        (job_id,uid,chat_id,source_message_id,kind,"active",json.dumps(payload),source_path,0,now,now))
+    return job_id
+
+async def _job_update(job_id, state=None, payload=None, source_path=None, attempts_inc=False):
+    fields=[]; vals=[]
+    if state is not None: fields += ["state=%s"]; vals += [state]
+    if payload is not None: fields += ["payload=%s"]; vals += [json.dumps(payload)]
+    if source_path is not None: fields += ["source_path=%s"]; vals += [source_path]
+    if attempts_inc: fields += ["attempts=attempts+1"]
+    fields += ["updated_at=%s"]; vals += [time.time(), job_id]
+    await asyncio.to_thread(_db_exec_sync, "UPDATE video_jobs SET "+", ".join(fields)+" WHERE job_id=%s", tuple(vals))
+
+async def _job_finish(job_id, state="done"):
+    await _job_update(job_id, state=state)
+
+async def _job_get_active():
+    rows=await asyncio.to_thread(_db_exec_sync,
+        "SELECT job_id,uid,chat_id,source_message_id,kind,state,payload,source_path,attempts FROM video_jobs WHERE state IN ('active','recovering','retry') ORDER BY created_at", (), True)
+    out=[]
+    for r in rows:
+        out.append({"job_id":r[0],"uid":int(r[1]),"chat_id":int(r[2]),"source_message_id":int(r[3]),"kind":r[4],"state":r[5],"payload":json.loads(r[6] or "{}"),"source_path":r[7],"attempts":int(r[8] or 0)})
+    return out
+
+async def _job_delete(job_id):
+    await asyncio.to_thread(_db_exec_sync, "DELETE FROM video_jobs WHERE job_id=%s", (job_id,))
+
+async def _source_for(uid):
+    rows=await asyncio.to_thread(_db_exec_sync,
+        "SELECT job_id,chat_id,source_message_id,source_path FROM video_jobs WHERE uid=%s AND kind='source' AND state='ready' ORDER BY updated_at DESC LIMIT 1", (uid,), True)
+    if not rows: return None
+    r=rows[0]
+    return {"job_id":r[0],"chat_id":int(r[1]),"source_message_id":int(r[2]),"source_path":r[3]}
+
+# ══════════════════════════════════════════════════════════════
 #  CONSTANTS & DIRS
 # ══════════════════════════════════════════════════════════════
 DOWNLOAD_DIR        = "downloads"
@@ -113,7 +224,11 @@ MIN_PART_BYTES      = 1024            # FIX #21 — reject parts smaller than 1 
 FFMPEG_MERGE_TIMEOUT    = 900          # 15 min for merge
 FFMPEG_COMPRESS_TIMEOUT = 1800         # 30 min for re-encode/compress
 FFMPEG_AUDIO_TIMEOUT    = 300          # 5 min for audio extraction
-SCENE_DETECT_TIMEOUT    = 600          # 10 min — full decode pass, same budget as FFMPEG_CUT_TIMEOUT
+SCENE_DETECT_TIMEOUT    = 600          # hard upper bound; scene scan is downscaled/low-FPS
+SCENE_MIN_GAP_SEC       = float(os.getenv("SCENE_MIN_GAP_SEC", "4.5"))
+SCENE_MAX_COUNT         = int(os.getenv("SCENE_MAX_COUNT", "40"))
+SCENE_SCAN_FPS          = float(os.getenv("SCENE_SCAN_FPS", "5"))
+SCENE_SCAN_WIDTH        = int(os.getenv("SCENE_SCAN_WIDTH", "480"))
 MAX_MERGE_VIDEOS        = 20           # cap merge queue size
 COMPRESS_PRESETS        = {"low": 28, "medium": 23, "high": 18}  # CRF values (lower = better quality)
 WHISPER_MAX_BYTES       = 24 * 1024 * 1024   # stay under Groq's 25MB free-tier cap, with margin
@@ -123,6 +238,9 @@ HIGHLIGHT_MIN_SEC       = 20                  # floor — LLM picks are clamped/
 HIGHLIGHT_MAX_SEC       = 70                  # ceiling
 HIGHLIGHT_MIN_COUNT     = 5
 HIGHLIGHT_MAX_COUNT     = 10
+HIGHLIGHT_CANDIDATE_MAX  = int(os.getenv("HIGHLIGHT_CANDIDATE_MAX", "24"))
+HIGHLIGHT_VISION_CHECKS  = int(os.getenv("HIGHLIGHT_VISION_CHECKS", "6"))
+HIGHLIGHT_USE_VISION     = os.getenv("HIGHLIGHT_USE_VISION", "1").lower() not in {"0", "false", "no"}
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 os.makedirs(THUMB_DIR,    exist_ok=True)
@@ -155,6 +273,7 @@ def _cleanup_stale_files() -> None:
     if removed:
         log.info(f"🧹 Cleaned {removed} stale file(s) from previous session.")
 
+# V10: stale cleanup intentionally avoids protected job files; recovery decides what is safe.
 _cleanup_stale_files()
 
 
@@ -165,8 +284,9 @@ app = Client(
     "ultra-bot",
     api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN,
     in_memory=True,
-    sleep_threshold=300,
+    sleep_threshold=60,
     ipv6=False,
+    max_concurrent_transmissions=max(1, min(2, int(os.getenv("MAX_CONCURRENT_TRANSMISSIONS", "1")))),
 )
 
 
@@ -174,6 +294,7 @@ app = Client(
 #  PER-USER STATE
 # ══════════════════════════════════════════════════════════════
 user_files:  dict[int, str]           = {}
+user_sources: dict[int, dict]         = {}
 user_locks:  dict[int, asyncio.Lock]  = {}
 user_cancel: dict[int, asyncio.Event] = {}
 user_status: dict[int, dict]          = {}
@@ -318,8 +439,13 @@ async def _dedup(message) -> bool:
 class _UserCancelled(Exception):
     pass
 
-THROTTLE  = 0.5
+THROTTLE  = 1.2
 EMA_ALPHA = 0.35
+
+FAST_UPLOAD_MODE = os.getenv("FAST_UPLOAD_MODE", "1").strip().lower() not in {"0", "false", "no"}
+ENABLE_UPLOAD_THUMB = os.getenv("ENABLE_UPLOAD_THUMB", "0").strip().lower() in {"1", "true", "yes"}
+MAX_INPUT_BYTES = int(os.getenv("MAX_INPUT_MB", "2000")) * 1024 * 1024
+DISK_SAFETY_BYTES = 256 * 1024 * 1024
 SPINNER   = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"]
 
 _last_edit: dict[int, float] = {}
@@ -391,38 +517,39 @@ async def _safe_edit(msg, text: str, reply_markup=None) -> None:
 
 async def progress(current, total, msg, start, uid: int = 0,
                    mode: str = "📥 Download") -> None:
+    """Keep the transmission callback lightweight; UI updates are throttled."""
     if _get_cancel(uid).is_set():
+        try:
+            app.stop_transmission()
+        except Exception:
+            pass
         raise _UserCancelled()
-    if not isinstance(total, (int, float)) or total <= 0: return
-    now     = time.time()
+
+    if not isinstance(total, (int, float)) or total <= 0:
+        return
+
+    now = time.time()
     elapsed = max(now - start, 0.001)
-    # FIX — liveness signal (used by the idle watchdog) must update on
-    # EVERY progress() call, not only when we actually edit the message.
-    # Previously this line ran only after the throttle check below, so
-    # on large (2GB+) files any callback that landed inside the 0.5s
-    # UI-throttle window never refreshed _last_edit — bytes were still
-    # flowing but the watchdog saw a stale timestamp and eventually
-    # misfired a false "stalled" abort. Splitting the two concerns
-    # fixes it: liveness updates unconditionally, UI-edit stays throttled.
     prev_edit = _last_edit.get(uid, 0.0)
-    _last_edit[uid] = now
+    _last_edit[uid] = now  # liveness signal on every transferred chunk
     if now - prev_edit < THROTTLE and prev_edit != 0.0:
         return
-    raw   = current / elapsed
-    ema   = EMA_ALPHA * raw + (1 - EMA_ALPHA) * _ema_speed.get(uid, raw)
+
+    raw = current / elapsed
+    ema = EMA_ALPHA * raw + (1 - EMA_ALPHA) * _ema_speed.get(uid, raw)
     _ema_speed[uid] = ema
     eta_s = (total - current) / ema if ema > 0 else 0
-    real  = current * 100 / total
-    shown = _count_up(uid, real)
-    spin  = SPINNER[_spin_idx.get(uid, 0) % len(SPINNER)]
+    pct = max(0.0, min(100.0, current * 100 / total))
+    kb = ema / 1024
+    tier = "🟢 Fast" if kb >= 1024 else ("🟡 Good" if kb >= 256 else "🔴 Slow")
+    spin = SPINNER[_spin_idx.get(uid, 0) % len(SPINNER)]
     _spin_idx[uid] = _spin_idx.get(uid, 0) + 1
-    kb    = ema / 1024
-    tier  = "🟢 Fast" if kb >= 1024 else ("🟡 Good" if kb >= 256 else "🔴 Slow")
+
     await _safe_edit(msg,
         f"{spin} **{mode}**\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{_bar(shown)}\n"
-        f"  {_badge(shown)} **{shown:.1f}%** ·  {_sz(current)} / {_sz(total)}\n"
+        f"{_bar(pct)}\n"
+        f"  {_badge(pct)} **{pct:.1f}%** · {_sz(current)} / {_sz(total)}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"  🚄 **Speed** : `{_sz(ema)}/s`  {tier}\n"
         f"  ⏱ **ETA** : `{_eta(eta_s)}`\n"
@@ -804,39 +931,40 @@ async def ffmpeg_extract_audio(inp: str, out: str,
 
 
 async def detect_scenes(file: str, uid: int, status_msg, total_duration: float,
-                        threshold: float = 10.0, max_cuts: int = 99) -> list[float]:
-    """Detect scene-change timestamps using ffmpeg's `scdet` filter.
+                        threshold: float = 8.0, max_cuts: int | None = None) -> list[float]:
+    """Fast, conservative scene detector.
 
-    FIX #29 — originally used the classic `select='gt(scene,X)'` heuristic
-    with threshold 0.4 (the commonly cited default). Testing this against
-    real cut points revealed it can score genuine hard cuts as ~0 on some
-    content (its metric leans on texture/edge complexity, not raw pixel
-    difference), so it can silently find nothing on legitimate cuts.
-    `scdet` is ffmpeg's purpose-built, modern replacement — testing showed
-    a real cut scoring ~26 against ~0.0–0.4 for ordinary in-scene motion,
-    a much cleaner separation. We log every frame's score in one pass
-    (threshold=0 so nothing is filtered at the ffmpeg level), then apply
-    our own threshold in Python — with an adaptive step-down if nothing
-    clears it, since natural score distributions vary a lot by content
-    type (animation vs. live-action vs. screen recordings, etc.).
+    The old implementation decoded every source frame and then accepted *any*
+    threshold hit. On fast-cut TV/video that turns tiny score spikes into
+    dozens of 0.5-3 second clips (e.g. 85 scenes from a 3-minute video).
 
-    FIX #32 — this used to run silently for up to SCENE_DETECT_TIMEOUT
-    (10 min) with zero feedback beyond the initial "Scanning…" message. Now
-    streams the same live bar/%/speed/ETA UI as compress/merge via
-    `-progress pipe:1` on stdout, while stderr — needed in FULL, every
-    frame's scdet score/time debug line, not just a tail — is drained
-    concurrently on its own task instead of one blocking communicate() call.
-    A size cap still guards memory on very long/high-framerate videos (past
-    the cap, scoring data is silently dropped rather than crashing — a very
-    long scan may only find cuts in the portion that fit).
+    This version:
+      1. scans a downscaled 480px stream at 5fps (much lighter on Render Free),
+      2. collects scdet scores without retaining a giant debug log,
+      3. uses an adaptive threshold with a hard floor,
+      4. performs non-maximum suppression so nearby spikes become one cut,
+      5. enforces a minimum scene length, and
+      6. caps the total number of scenes according to video duration.
+
+    Returned values are GLOBAL timestamps of accepted cuts.
     """
+    if not total_duration or total_duration <= 1:
+        return []
+
+    min_gap = max(2.5, SCENE_MIN_GAP_SEC)
+    duration_cap = max(2, int(math.ceil(total_duration / min_gap)))
+    if max_cuts is None:
+        max_cuts = max(1, min(SCENE_MAX_COUNT - 1, duration_cap - 1))
+    max_cuts = max(1, min(int(max_cuts), SCENE_MAX_COUNT - 1))
+
+    fps = max(2.0, min(8.0, SCENE_SCAN_FPS))
+    width = max(240, min(720, SCENE_SCAN_WIDTH))
+
     try:
         proc = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-i", file,
-            "-filter:v", "scdet=threshold=0",
-            "-f", "null", "-",
-            "-loglevel", "debug",
-            "-progress", "pipe:1", "-nostats",
+            "ffmpeg", "-hide_banner", "-loglevel", "info", "-i", file,
+            "-vf", f"fps={fps:g},scale={width}:-2:flags=fast_bilinear,scdet=threshold=0",
+            "-an", "-f", "null", "-", "-progress", "pipe:1", "-nostats",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -844,51 +972,71 @@ async def detect_scenes(file: str, uid: int, status_msg, total_duration: float,
         log.error(f"detect_scenes failed to start: {e}")
         return []
 
-    MAX_STDERR_BYTES = 24 * 1024 * 1024  # safety cap — debug logging on very long videos
-    stderr_chunks: list[bytes] = []
-    stderr_total = 0
+    # Keep only the tiny amount of stderr needed for score parsing.  The old
+    # code stored up to 24MB of debug output, which is unnecessary on a free
+    # 512MB service and could itself become a memory pressure point.
+    scores: list[tuple[float, float]] = []
+    stderr_buf = b""
+    progress_buf = b""
+    last_ui = 0.0
+    t0 = time.time()
 
-    async def _drain_stderr_full():
-        nonlocal stderr_total
+    async def drain_stderr():
+        nonlocal stderr_buf
         try:
             while True:
                 chunk = await proc.stderr.read(65536)
                 if not chunk:
                     break
-                stderr_total += len(chunk)
-                if stderr_total <= MAX_STDERR_BYTES:
-                    stderr_chunks.append(chunk)
+                stderr_buf += chunk
+                # Parse complete lines and immediately discard them.
+                if len(stderr_buf) > 512 * 1024:
+                    stderr_buf = stderr_buf[-256 * 1024:]
+                lines = stderr_buf.split(b"\n")
+                stderr_buf = lines.pop() if lines else b""
+                for raw in lines:
+                    line = raw.decode(errors="ignore")
+                    m = re.search(r"lavfi\.scd\.score:\s*([0-9.]+),\s*lavfi\.scd\.time:\s*([0-9.]+)", line)
+                    if m:
+                        try:
+                            scores.append((float(m.group(1)), float(m.group(2))))
+                        except ValueError:
+                            pass
+        except asyncio.CancelledError:
+            raise
         except Exception:
             pass
 
-    async def _read_stdout_progress():
-        buf = b""
-        snap: dict[str, str] = {}
+    async def drain_progress():
+        nonlocal progress_buf, last_ui
         try:
             while True:
                 chunk = await proc.stdout.read(4096)
                 if not chunk:
                     break
-                buf += chunk
-                while b"\n" in buf:
-                    line, buf = buf.split(b"\n", 1)
-                    s = line.decode(errors="ignore").strip()
-                    if "=" not in s:
+                progress_buf += chunk
+                while b"\n" in progress_buf:
+                    line, progress_buf = progress_buf.split(b"\n", 1)
+                    m = re.search(rb"out_time_us=(\d+)", line)
+                    if not m:
                         continue
-                    k, _, v = s.partition("=")
-                    snap[k] = v
-                    if k == "progress":
-                        await _emit_ffmpeg_progress(uid, status_msg, "🔍 Scanning for scenes…",
-                                                    snap, t0, total_duration)
-                        snap = {}
+                    now = time.time()
+                    if now - last_ui < 1.2:
+                        continue
+                    last_ui = now
+                    done_sec = min(total_duration, int(m.group(1)) / 1_000_000)
+                    pct = int(done_sec * 100 / total_duration)
+                    await _safe_edit(status_msg,
+                        f"🔍 **Scene scan**\n{_bar(pct, 16)} **{pct}%**\n"
+                        f"  Scanning at `{fps:g}fps / {width}px`\n"
+                        f"  ❌ /cancel to stop")
+        except asyncio.CancelledError:
+            raise
         except Exception:
             pass
 
-    _reset(uid)
-    t0 = time.time()
-    drain_task = asyncio.create_task(_drain_stderr_full())
-    progress_task = asyncio.create_task(_read_stdout_progress())
-
+    drain_task = asyncio.create_task(drain_stderr())
+    progress_task = asyncio.create_task(drain_progress())
     try:
         while True:
             if _get_cancel(uid).is_set():
@@ -896,7 +1044,7 @@ async def detect_scenes(file: str, uid: int, status_msg, total_duration: float,
                 return []
             if time.time() - t0 > SCENE_DETECT_TIMEOUT:
                 await _kill_proc(proc)
-                log.error(f"detect_scenes timed out: {file}")
+                log.error("detect_scenes timed out")
                 return []
             try:
                 await asyncio.wait_for(proc.wait(), timeout=1)
@@ -904,38 +1052,81 @@ async def detect_scenes(file: str, uid: int, status_msg, total_duration: float,
             except asyncio.TimeoutError:
                 continue
     finally:
-        drain_task.cancel()
+        try:
+            await asyncio.wait_for(drain_task, timeout=2)
+        except Exception:
+            drain_task.cancel()
         progress_task.cancel()
-        for t in (drain_task, progress_task):
-            try:
-                await t
-            except (asyncio.CancelledError, Exception):
-                pass
+        try:
+            await progress_task
+        except BaseException:
+            pass
 
-    try:
-        text = b"".join(stderr_chunks).decode(errors="ignore")
-        pairs = re.findall(
-            r"lavfi\.scd\.score:\s*([\d.]+),\s*lavfi\.scd\.time:\s*([\d.]+)", text
-        )
-        if not pairs:
-            log.warning(f"detect_scenes: no scdet output parsed for {file}")
-            return []
-
-        scored = [(float(s), float(t)) for s, t in pairs]
-
-        cuts: list[float] = []
-        for th in (threshold, threshold / 2, threshold / 5, threshold / 10):
-            cuts = sorted(t for s, t in scored if s >= th)
-            if cuts:
-                break
-
-        if len(cuts) > max_cuts:
-            step = math.ceil(len(cuts) / max_cuts)
-            cuts = cuts[::step]
-        return cuts
-    except Exception as e:
-        log.error(f"detect_scenes exception: {e}")
+    if proc.returncode != 0:
+        log.error(f"detect_scenes ffmpeg rc={proc.returncode}")
         return []
+
+    # Flush any final complete stderr line.
+    tail = stderr_buf.decode(errors="ignore")
+    for m in re.finditer(r"lavfi\.scd\.score:\s*([0-9.]+),\s*lavfi\.scd\.time:\s*([0-9.]+)", tail):
+        try:
+            scores.append((float(m.group(1)), float(m.group(2))))
+        except ValueError:
+            pass
+
+    if not scores:
+        log.warning("detect_scenes: no scdet scores found")
+        return []
+
+    # Ignore the initial frame and extremely late/end timestamps.
+    scores = [(s, t) for s, t in scores if 0.15 < t < total_duration - 0.15 and math.isfinite(s)]
+    if not scores:
+        return []
+
+    values = sorted(s for s, _ in scores)
+    p90 = values[int(0.90 * (len(values) - 1))]
+    adaptive = max(float(threshold), min(14.0, p90 * 1.5))
+    # Hard cuts in scdet are commonly much larger than ordinary motion. Keep
+    # a floor so a low-contrast source cannot explode into hundreds of cuts.
+    adaptive = max(6.0, adaptive)
+
+    raw = [(s, t) for s, t in scores if s >= adaptive]
+    if not raw:
+        raw = [(s, t) for s, t in scores if s >= max(4.0, adaptive * 0.65)]
+    if not raw:
+        return []
+
+    # Non-maximum suppression: for each minimum-gap bucket keep the strongest
+    # actual cut instead of accepting every nearby spike.
+    raw.sort(key=lambda x: x[1])
+    candidates: list[tuple[float, float]] = []
+    cluster: list[tuple[float, float]] = []
+    for item in raw:
+        if not cluster or item[1] - cluster[-1][1] <= min_gap:
+            cluster.append(item)
+        else:
+            candidates.append(max(cluster, key=lambda x: x[0]))
+            cluster = [item]
+    if cluster:
+        candidates.append(max(cluster, key=lambda x: x[0]))
+
+    # Enforce a true minimum distance between accepted boundaries.
+    accepted: list[tuple[float, float]] = []
+    for score, ts in sorted(candidates, key=lambda x: x[1]):
+        if not accepted or ts - accepted[-1][1] >= min_gap:
+            accepted.append((score, ts))
+        elif score > accepted[-1][0]:
+            accepted[-1] = (score, ts)
+
+    # If still too many, retain the strongest cuts while preserving timeline order.
+    if len(accepted) > max_cuts:
+        strongest = sorted(accepted, key=lambda x: x[0], reverse=True)[:max_cuts]
+        accepted = sorted(strongest, key=lambda x: x[1])
+
+    cuts = [round(ts, 2) for _, ts in accepted]
+    log.info("Scene detector: %d scores -> %d cuts (threshold=%.2f, min_gap=%.2fs)",
+             len(scores), len(cuts), adaptive, min_gap)
+    return cuts
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1076,82 +1267,185 @@ async def _transcribe_video(file: str, dur: float, uid: int, status_msg) -> list
 
 
 async def _select_highlights(segments: list[dict], duration: float) -> list[dict]:
-    """Ask the LLM to pick the 5-10 best highlight-worthy moments from a
-    timestamped transcript. Returns [{start, end, reason}, ...], validated,
-    clamped to sane durations, de-overlapped, and ranked-order preserved.
-    Empty list on any failure — caller shows a graceful fallback message."""
+    """Multi-stage text-AI highlight selector.
+
+    Stage 1: Whisper supplies timestamped speech.
+    Stage 2: the LLM ranks self-contained moments instead of blindly asking
+             for arbitrary timestamps.
+    Stage 3 (in _vision_rank_highlights): a vision model checks the selected
+             frames and re-ranks them before the final cuts are made.
+    """
     if not AI_ENABLED or not segments:
         return []
 
+    # Compact transcript keeps API payload reasonable on long videos while
+    # retaining timestamps and enough surrounding dialogue for setup/punchline.
     lines = []
     for s in segments:
-        m, sec = divmod(int(s["start"]), 60)
-        lines.append(f"[{m:02d}:{sec:02d}] {s['text'].strip()}")
+        text = re.sub(r"\s+", " ", str(s.get("text", "")).strip())
+        if not text:
+            continue
+        m, sec = divmod(int(max(0, s["start"])), 60)
+        lines.append(f"[{m:02d}:{sec:02d}] {text[:500]}")
     transcript = "\n".join(lines)
-    if len(transcript) > 60000:  # guard against blowing the LLM's context window
-        transcript = transcript[:60000] + "\n...[transcript truncated]"
+    if len(transcript) > 50000:
+        transcript = transcript[:50000] + "\n...[transcript truncated]"
 
+    candidate_target = min(HIGHLIGHT_CANDIDATE_MAX, max(HIGHLIGHT_MAX_COUNT * 2, 12))
     prompt = (
-        f"You are selecting the best highlight clips from a {duration/60:.0f}-minute "
-        f"video for social media, aiming for maximum shareable/viral potential.\n\n"
-        f"Timestamped transcript:\n{transcript}\n\n"
-        f"Select {HIGHLIGHT_MIN_COUNT} to {HIGHLIGHT_MAX_COUNT} of the BEST moments as "
-        f"standalone clips. Rules:\n"
-        f"- Each clip must be {HIGHLIGHT_MIN_SEC}-{HIGHLIGHT_MAX_SEC} seconds long\n"
-        f"- Pick moments with strong drama, emotion, comedy, conflict, a punchline, "
-        f"a twist, or a cliffhanger — not random ordinary dialogue\n"
-        f"- Prefer self-contained moments that make sense without extra context\n"
-        f"- Clips must not overlap\n"
-        f"- Order by how good/viral-worthy each is, best first\n\n"
-        f'Respond ONLY with JSON in this exact shape: '
-        f'{{"highlights": [{{"start": 123.4, "end": 165.0, "reason": "short reason, max 10 words"}}, ...]}}'
+        f"You are the first AI judge for a {duration/60:.1f}-minute video.\n"
+        f"Find up to {candidate_target} candidate highlight moments from this timestamped transcript.\n\n"
+        f"Rules:\n"
+        f"- A moment should be self-contained and understandable.\n"
+        f"- Prefer comedy, emotion, surprise, conflict, useful information, a punchline, reveal, or strong reaction.\n"
+        f"- Include enough setup before the payoff.\n"
+        f"- Target {HIGHLIGHT_MIN_SEC}-{HIGHLIGHT_MAX_SEC}s per final clip.\n"
+        f"- Never invent timestamps outside the transcript/video.\n"
+        f"- Candidates may overlap at this stage, but final clips must not overlap.\n"
+        f"- score is 0-100 for highlight quality, not video quality.\n\n"
+        f"TRANSCRIPT:\n{transcript}\n\n"
+        f'Respond ONLY JSON: {{"highlights":[{{"start":123.4,"end":165.0,"score":92,"reason":"short reason"}}]}}'
     )
     try:
         resp = await asyncio.wait_for(
             _groq_client.chat.completions.create(
                 model=GROQ_MODEL,
                 messages=[{"role": "user", "content": prompt}],
-                max_tokens=1200,
-                temperature=0.4,
+                max_tokens=1800,
+                temperature=0.2,
                 response_format={"type": "json_object"},
             ),
-            timeout=60,
+            timeout=90,
         )
         data = json.loads(resp.choices[0].message.content)
         items = data.get("highlights", []) if isinstance(data, dict) else []
     except asyncio.TimeoutError:
-        log.warning("_select_highlights timed out.")
+        log.warning("_select_highlights timed out")
         return []
     except Exception as e:
-        log.warning(f"_select_highlights LLM call/parse failed: {e}")
+        log.warning(f"_select_highlights failed: {e}")
         return []
 
-    picked = []
+    picked: list[dict] = []
     for it in items:
         try:
-            start = float(it["start"])
-            end = float(it["end"])
-            reason = str(it.get("reason", "")).strip()[:80]
+            start = max(0.0, float(it["start"]))
+            end = min(duration, float(it["end"]))
+            score = max(0.0, min(100.0, float(it.get("score", 50))))
+            reason = re.sub(r"\s+", " ", str(it.get("reason", "Highlight moment"))).strip()[:90]
         except (KeyError, TypeError, ValueError):
             continue
-        if start < 0 or end <= start or end > duration + 1:
-            continue
-        if end - start > HIGHLIGHT_MAX_SEC:           # never exceed the user's stated ceiling
-            end = start + HIGHLIGHT_MAX_SEC
-        if end - start < HIGHLIGHT_MIN_SEC * 0.5:     # way too short to be a real pick — discard
-            continue
-        picked.append({"start": start, "end": min(end, duration), "reason": reason or "Highlight moment"})
 
-    # Remove overlaps (keep earlier/higher-ranked picks), preserve original rank order
-    picked_by_time = sorted(range(len(picked)), key=lambda i: picked[i]["start"])
-    keep_idx = set()
-    last_end = -1.0
-    for i in picked_by_time:
-        if picked[i]["start"] >= last_end - 1:
-            keep_idx.add(i)
-            last_end = picked[i]["end"]
-    final = [picked[i] for i in range(len(picked)) if i in keep_idx]
-    return final[:HIGHLIGHT_MAX_COUNT]
+        # Expand very short AI picks to preserve setup + payoff, then clamp.
+        if end - start < HIGHLIGHT_MIN_SEC:
+            center = (start + end) / 2
+            half = HIGHLIGHT_MIN_SEC / 2
+            start = max(0.0, center - half)
+            end = min(duration, start + HIGHLIGHT_MIN_SEC)
+            if end - start < HIGHLIGHT_MIN_SEC:
+                start = max(0.0, end - HIGHLIGHT_MIN_SEC)
+        if end - start > HIGHLIGHT_MAX_SEC:
+            end = start + HIGHLIGHT_MAX_SEC
+        if end <= start or end - start < HIGHLIGHT_MIN_SEC * 0.75:
+            continue
+        picked.append({"start": start, "end": min(end, duration),
+                       "score": score, "reason": reason or "Highlight moment"})
+
+    # Deduplicate heavily overlapping model picks, retaining the stronger one.
+    picked.sort(key=lambda x: x["score"], reverse=True)
+    selected: list[dict] = []
+    for item in picked:
+        overlap = False
+        for kept in selected:
+            inter = max(0.0, min(item["end"], kept["end"]) - max(item["start"], kept["start"]))
+            shorter = min(item["end"] - item["start"], kept["end"] - kept["start"])
+            if shorter > 0 and inter / shorter >= 0.35:
+                overlap = True
+                break
+        if not overlap:
+            selected.append(item)
+        if len(selected) >= HIGHLIGHT_MAX_COUNT:
+            break
+
+    return sorted(selected, key=lambda x: x["start"])
+
+
+async def _vision_rank_highlights(video: str, uid: int, highlights: list[dict]) -> list[dict]:
+    """Second AI judge: inspect representative frames and re-rank picks.
+
+    Vision is intentionally limited to a handful of candidates so Render Free
+    is not buried under dozens of FFmpeg/API calls. If vision fails, the text-AI
+    ranking is retained unchanged.
+    """
+    if not AI_ENABLED or not HIGHLIGHT_USE_VISION or not highlights:
+        return highlights
+
+    ranked = list(highlights)
+    checks = min(HIGHLIGHT_VISION_CHECKS, len(ranked))
+    # Check strongest candidates first; the rest keep their text-AI score.
+    ranked.sort(key=lambda h: h.get("score", 0), reverse=True)
+
+    async def score_one(index: int, item: dict):
+        thumb_path = f"{THUMB_DIR}/hv_{uid}_{index}.jpg"
+        try:
+            mid = (item["start"] + item["end"]) / 2
+            thumb = await make_thumb(video, mid, thumb_path)
+            if not thumb:
+                return
+            with open(thumb, "rb") as f:
+                img_b64 = base64.b64encode(f.read()).decode()
+            prompt = (
+                "You are the second AI judge for a short-video highlight. "
+                "Judge ONLY the visible frame: does it look like a meaningful, "
+                "engaging moment rather than a blank/transition/boring frame? "
+                "Return JSON only: {\"score\":0-100,\"reason\":\"max 8 words\"}."
+            )
+            resp = await asyncio.wait_for(
+                _groq_client.chat.completions.create(
+                    model=GROQ_VISION_MODEL,
+                    messages=[{"role": "user", "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
+                    ]}],
+                    max_tokens=80,
+                    temperature=0.1,
+                    response_format={"type": "json_object"},
+                ),
+                timeout=AI_VISION_TIMEOUT,
+            )
+            data = json.loads(resp.choices[0].message.content)
+            vscore = max(0.0, min(100.0, float(data.get("score", 50))))
+            # Text AI remains the primary judge; vision breaks ties / removes
+            # visually weak frames instead of overpowering transcript quality.
+            item["score"] = item.get("score", 50) * 0.70 + vscore * 0.30
+            vr = str(data.get("reason", "")).strip()
+            if vr:
+                item["vision_reason"] = vr[:60]
+        except Exception as e:
+            log.warning(f"highlight vision check failed: {e}")
+        finally:
+            try:
+                if os.path.exists(thumb_path):
+                    os.remove(thumb_path)
+            except Exception:
+                pass
+
+    await asyncio.gather(*(score_one(i, ranked[i]) for i in range(checks)), return_exceptions=True)
+
+    # Re-rank and remove overlaps again after the second AI score.
+    ranked.sort(key=lambda h: h.get("score", 0), reverse=True)
+    final: list[dict] = []
+    for item in ranked:
+        if any(
+            max(0.0, min(item["end"], x["end"]) - max(item["start"], x["start"]))
+            / max(0.1, min(item["end"] - item["start"], x["end"] - x["start"])) >= 0.35
+            for x in final
+        ):
+            continue
+        final.append(item)
+        if len(final) >= HIGHLIGHT_MAX_COUNT:
+            break
+    return sorted(final, key=lambda h: h["start"])
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1269,15 +1563,32 @@ async def _ai_caption_from_frame(thumb_path: str, num: int, total: int) -> str |
 # ══════════════════════════════════════════════════════════════
 #  INLINE KEYBOARDS — button-based UX (tap instead of type)
 # ══════════════════════════════════════════════════════════════
+def _main_menu_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✂️ Split & Scene", callback_data="menu:split"),
+         InlineKeyboardButton("🤖 AI Highlights", callback_data="menu:ai")],
+        [InlineKeyboardButton("🎬 Video Tools", callback_data="menu:tools"),
+         InlineKeyboardButton("🔗 Merge", callback_data="menu:merge")],
+        [InlineKeyboardButton("📊 Status / Info", callback_data="menu:status"),
+         InlineKeyboardButton("📖 All Commands", callback_data="menu:help")],
+        [InlineKeyboardButton("⚙️ How it works", callback_data="menu:how")],
+    ])
+
+
 def _quick_split_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✂️ 2 Parts", callback_data="qs:2"),
          InlineKeyboardButton("✂️ 3 Parts", callback_data="qs:3"),
          InlineKeyboardButton("✂️ 5 Parts", callback_data="qs:5")],
-        [InlineKeyboardButton("🔥 Best Clips (AI)", callback_data="qhighlights"),
-         InlineKeyboardButton("🎬 Scene Split", callback_data="qscene")],
-        [InlineKeyboardButton("🤖 Describe", callback_data="qdesc")],
+        [InlineKeyboardButton("🎬 Smart Scene", callback_data="qscene"),
+         InlineKeyboardButton("🔥 AI Highlights", callback_data="qhighlights")],
+        [InlineKeyboardButton("🛠 Tools", callback_data="menu:tools"),
+         InlineKeyboardButton("🤖 Describe", callback_data="qdesc")],
+        [InlineKeyboardButton("🔗 Merge", callback_data="menu:merge"),
+         InlineKeyboardButton("📊 Status", callback_data="menu:status")],
+        [InlineKeyboardButton("📖 Help", callback_data="menu:help")],
     ])
+
 
 def _merge_kb(count: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
@@ -1338,17 +1649,18 @@ async def _upload_part(message, path: str, num: int, total: int,
     _reset(uid)
     t0 = time.time()
     thumb_path = f"{THUMB_DIR}/thumb_{uid}_{num}.jpg"
-    thumb = await make_thumb(path, thumb_time, thumb_path)
-    uploaded = False
+    thumb = None
 
-    # AI caption — best effort, always falls back gracefully:
-    #   1) vision analysis of THIS part's actual thumbnail frame (best — content-aware)
-    #   2) filename-based text guess (if vision unavailable/failed)
-    #   3) plain "Part N / total" caption (if AI is off entirely)
+    # Fast mode keeps the upload path free from FFmpeg thumbnail/AI work.
+    # Enable those extras explicitly when desired.
+    if ENABLE_UPLOAD_THUMB and not FAST_UPLOAD_MODE:
+        thumb = await make_thumb(path, thumb_time, thumb_path)
+
+    uploaded = False
     ai_text = None
-    if thumb and os.path.exists(thumb_path):
+    if not FAST_UPLOAD_MODE and thumb and os.path.exists(thumb_path):
         ai_text = await _ai_caption_from_frame(thumb_path, num, total)
-    if not ai_text:
+    if not FAST_UPLOAD_MODE and not ai_text:
         orig_name = os.path.basename(user_files.get(uid, "")) or "video"
         ai_text = await _ai_caption(orig_name, num, total)
     base_caption = custom_caption or f"🎬 **Part {num} / {total}**"
@@ -1361,7 +1673,7 @@ async def _upload_part(message, path: str, num: int, total: int,
     # stopped right there with no retry. That's the "ruk jata hai last mein" bug.
     # FIX: retry a bounded number of times on transient/network-looking errors,
     # only give up for real (no retry) on errors that indicate TG already has it.
-    MAX_UPLOAD_ATTEMPTS = 3
+    MAX_UPLOAD_ATTEMPTS = 4
     NO_RETRY_MARKERS = ("FILE_PARTS_INVALID", "MEDIA_EMPTY", "FILE_ID_INVALID")
 
     for attempt in range(MAX_UPLOAD_ATTEMPTS):
@@ -1369,16 +1681,22 @@ async def _upload_part(message, path: str, num: int, total: int,
             await _safe_edit(status, "🚫 Upload cancelled.")
             break
         try:
-            await message.reply_video(
+            sent = await message.reply_video(
                 path,
                 caption=caption,
                 thumb=thumb,
+                supports_streaming=True,
                 progress=upload_progress,
                 progress_args=(status, t0, uid),
             )
+            if sent is None:
+                if _get_cancel(uid).is_set():
+                    await _safe_edit(status, "🚫 Upload cancelled.")
+                    break
+                raise RuntimeError("Telegram transmission returned no message")
             uploaded = True
             _track_part_created()
-            break  # ✅ NEVER retry after success — prevents double upload
+            break
 
         except _UserCancelled:
             await _safe_edit(status, "🚫 Upload cancelled.")
@@ -1403,7 +1721,7 @@ async def _upload_part(message, path: str, num: int, total: int,
                 await _safe_edit(status, f"❌ Upload failed part {num}: `{e}`")
                 break
 
-            backoff = 3 * (attempt + 1)
+            backoff = min(20, (2 ** attempt) + random.uniform(0.25, 1.25))
             log.error(f"Upload part {num} attempt {attempt+1} failed, retrying in {backoff}s: {e}")
             await _safe_edit(status,
                 f"⚠️ **Retry** — part {num}/{total} (attempt {attempt+2}/{MAX_UPLOAD_ATTEMPTS})\n"
@@ -1430,7 +1748,7 @@ async def _upload_part(message, path: str, num: int, total: int,
 #            upload/cancel/error-handling path instead of a copy.
 # ══════════════════════════════════════════════════════════════
 async def _run_split_segments(message, uid: int, segments: list[tuple[float, float]],
-                              label: str, caption_fn=None) -> None:
+                              label: str, caption_fn=None, job_id: str | None = None, start_index: int = 0) -> None:
     """
     segments: list of (start_seconds, duration_seconds) — one per output part.
     caption_fn(part_num, total) -> str | None — custom caption per part, or
@@ -1442,6 +1760,7 @@ async def _run_split_segments(message, uid: int, segments: list[tuple[float, flo
         return
 
     parts = len(segments)
+    start_index = max(0, min(start_index, parts))
     cancel = _get_cancel(uid)
     cancel.clear()
     t0 = time.time()
@@ -1453,6 +1772,8 @@ async def _run_split_segments(message, uid: int, segments: list[tuple[float, flo
     )
     try:
         for i, (ss, seg) in enumerate(segments):
+            if i < start_index:
+                continue
             if cancel.is_set():
                 await _safe_edit(msg,
                     f"🚫 **Cancelled!**\n  Stopped after **{i}** / **{parts}** parts.")
@@ -1470,10 +1791,14 @@ async def _run_split_segments(message, uid: int, segments: list[tuple[float, flo
             caption = caption_fn(i + 1, parts) if caption_fn else None
             uploaded = await _upload_part(message, out, i+1, parts, uid, ss + seg/2,
                                           custom_caption=caption)
+            if uploaded and job_id:
+                await _job_update(job_id, payload={"stage":"split","segments":segments,"next_index":i+1,"label":label})
             try:
                 if os.path.exists(out): os.remove(out)
             except: pass
             if not uploaded:
+                if job_id:
+                    await _job_update(job_id, state="retry", payload={"stage":"split","segments":segments,"next_index":i,"label":label})
                 await _safe_edit(msg,
                     f"🚫 **Stopped!**\n  Stopped after **{i+1}** / **{parts}** parts.")
                 _clear_status(uid)
@@ -1485,6 +1810,8 @@ async def _run_split_segments(message, uid: int, segments: list[tuple[float, flo
         except: pass
         user_files.pop(uid, None)
         _clear_status(uid)
+        if job_id:
+            await _job_finish(job_id, "done")
         total_elapsed = time.time() - t0
         avg_part = total_elapsed / parts if parts else 0
         await _safe_edit(msg,
@@ -1499,6 +1826,8 @@ async def _run_split_segments(message, uid: int, segments: list[tuple[float, flo
     except Exception as e:
         log.error(f"_run_split_segments error uid={uid}: {traceback.format_exc()}")
         _clear_status(uid)
+        if job_id:
+            await _job_update(job_id, state="retry", payload={"stage":"split","segments":segments,"next_index":start_index,"label":label})
         await _safe_edit(msg, f"❌ Error: `{e}`")
 
 
@@ -1523,7 +1852,11 @@ async def _do_split(message, uid: int, parts: int,
     seg = seg_override if seg_override is not None else dur / parts
     segments = [(i * seg, seg) for i in range(parts)]
     _track_video_processed()
-    await _run_split_segments(message, uid, segments, label)
+    src = user_sources.get(uid) or await _source_for(uid)
+    job_id = None
+    if src:
+        job_id = await _job_create(uid, message.chat.id, src["source_message_id"], "split", {"stage":"split","segments":segments,"next_index":0,"label":label}, file)
+    await _run_split_segments(message, uid, segments, label, job_id=job_id)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1534,9 +1867,80 @@ COMMAND_LIST = [
     "info",  "status", "cancel", "clear", "aistatus",
     "trim", "extractaudio", "compress", "splitscene", "highlights", "describe",
     "mergestart", "mergedone", "mergecancel",
-    "stats", "broadcast",
+    "stats", "broadcast", "retry", "resume",
 ]
 
+
+# ══════════════════════════════════════════════════════════════
+#  V10 RECOVERY COMMANDS
+# ══════════════════════════════════════════════════════════════
+async def _resume_job_record(job, message=None):
+    uid=job["uid"]
+    lock=_get_lock(uid)
+    if lock.locked(): return False, "Already processing"
+    async with lock:
+        _get_cancel(uid).clear()
+        src_msg=await app.get_messages(job["chat_id"], job["source_message_id"])
+        if not src_msg or not (src_msg.video or src_msg.document):
+            await _job_update(job["job_id"], state="retry")
+            return False, "Original Telegram message is unavailable"
+        path=job.get("source_path")
+        if not path or not os.path.exists(path):
+            ext="mp4"
+            media=src_msg.video or src_msg.document
+            mime=getattr(media,"mime_type","") or ""
+            ext_map={"video/x-matroska":"mkv","video/mkv":"mkv","video/avi":"avi","video/x-msvideo":"avi","video/webm":"webm","video/quicktime":"mov"}
+            ext=ext_map.get(mime,"mp4")
+            path=f"{DOWNLOAD_DIR}/recovery_{uid}_{job['job_id']}.{ext}"
+            status=message or src_msg
+            st=await status.reply("♻️ **Recovering original video from Telegram…**")
+            try:
+                path=await _await_with_watchdog(src_msg.download(file_name=path, progress=progress, progress_args=(st,time.time(),uid,"♻️ Recover")),uid)
+                await _safe_edit(st,"✅ Original recovered. Resuming job…")
+            except Exception as e:
+                await _job_update(job["job_id"], state="retry", attempts_inc=True)
+                await _safe_edit(st,f"⚠️ Recovery retry needed: `{str(e)[:120]}`")
+                return False, str(e)
+            await _job_update(job["job_id"], source_path=path)
+        user_files[uid]=path
+        user_sources[uid]={"chat_id":job["chat_id"],"source_message_id":job["source_message_id"],"source_path":path}
+        payload=job["payload"]
+        kind=job["kind"]
+        if kind in {"split","scene","highlights"}:
+            segs=[tuple(x) for x in payload.get("segments",[])]
+            if kind=="scene" and payload.get("stage")=="scan":
+                dur=await get_duration(path); cuts=await detect_scenes(path,uid,await src_msg.reply("🔍 **Resuming scene scan…**"),dur)
+                segs=_scene_segments_from_cuts(cuts,dur)
+                payload.update({"stage":"split","cuts":cuts,"segments":segs,"next_index":0})
+                await _job_update(job["job_id"],payload=payload)
+            if kind=="highlights" and payload.get("stage") in {"transcribe","select","vision"}:
+                dur=await get_duration(path)
+                st=await src_msg.reply("♻️ **Resuming AI highlight analysis…**")
+                if payload.get("stage")=="transcribe" or not payload.get("segments"):
+                    segs=await _transcribe_video(path,dur,uid,st); payload["segments"]=segs; payload["stage"]="select"; await _job_update(job["job_id"],payload=payload)
+                if payload.get("stage")=="select":
+                    hs=await _select_highlights(payload.get("segments",[]),dur); payload["highlights"]=hs; payload["stage"]="vision" if HIGHLIGHT_USE_VISION else "split"; await _job_update(job["job_id"],payload=payload)
+                if payload.get("stage")=="vision" and HIGHLIGHT_USE_VISION:
+                    hs=await _vision_rank_highlights(path,uid,payload.get("highlights",[])); payload["highlights"]=hs; payload["stage"]="split"; await _job_update(job["job_id"],payload=payload)
+                segs=[(h["start"],h["end"]-h["start"]) for h in payload.get("highlights",[])]
+                payload["segments"]=segs; await _job_update(job["job_id"],payload=payload)
+            label=payload.get("label",f"Recovered {kind} job…")
+            await _run_split_segments(src_msg,uid,segs,label,job_id=job["job_id"],start_index=int(payload.get("next_index",0)))
+            return True,"resumed"
+    return False,"unsupported"
+
+@app.on_message(filters.command("retry"), group=1)
+async def cmd_retry(client,message):
+    if await _dedup(message): return
+    uid=_uid(message)
+    jobs=[j for j in await _job_get_active() if j["uid"]==uid]
+    if not jobs: return await message.reply("ℹ️ No recoverable job found.")
+    ok,why=await _resume_job_record(jobs[-1],message)
+    if not ok: await message.reply(f"⚠️ Recovery could not start: `{why}`")
+
+@app.on_message(filters.command("resume"), group=1)
+async def cmd_resume(client,message):
+    return await cmd_retry(client,message)
 
 # ══════════════════════════════════════════════════════════════
 #  COMMANDS
@@ -1546,60 +1950,54 @@ async def cmd_start(client, message):
     if await _dedup(message): return
     name = getattr(message.from_user, "first_name", "User") or "User"
     await message.reply(
-        f"⚡ **ULTRA BOT v6** — ready!\n\n"
-        f"👋 Hey **{name}**!\n\n"
-        f"📤 Send any **video**, then:\n"
-        f"  • `/split 3`       — N equal parts\n"
-        f"  • `/splitmin 2`    — chunk every N minutes\n"
-        f"  • `/splitsize 500` — chunk every N MB\n"
-        f"  • `/splitscene`    — split at every shot/cut (many small clips)\n"
-        f"  • `/highlights`    — 🔥 AI picks the 5-10 BEST moments (30-60s each)\n\n"
-        f"🎛 **Video tools:**\n"
-        f"  • `/trim 1:00 3:30` — extract a clip\n"
-        f"  • `/compress medium` — shrink file size\n"
-        f"  • `/extractaudio`   — get audio as MP3\n"
-        f"  • `/mergestart`     — merge multiple videos\n\n"
-        f"🤖 **AI:** `/describe` — what's in this video?\n\n"
-        f"🛠 **Utils:** `/info` · `/status` · `/cancel` · `/clear`\n"
-        f"  • `/help` — full help\n\n"
-        f"✨ Multi-user · Async ffmpeg · Auto thumbnails\n"
-        f"🔁 Retry-safe uploads · 🔄 FloodWait safe · No crash"
+        f"⚡ **VIDEO SPLIT PRO v10**\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"👋 Welcome, **{name}**!\n\n"
+        f"🎥 **Step 1 — Send your video**\n"
+        f"📥 Wait for `Download complete`\n"
+        f"🎛 **Step 2 — Choose an action below**\n\n"
+        f"✨ Fast split • Smart scenes • Multi-AI highlights\n"
+        f"🔁 Retry-safe uploads • Live progress • `/cancel` anytime\n\n"
+        f"👇 **Choose what you want to do:**",
+        reply_markup=_main_menu_kb(),
     )
 
 @app.on_message(filters.command("help"), group=1)
 async def cmd_help(client, message):
     if await _dedup(message): return
-    admin_line = "\n  `/stats` · `/broadcast msg` → admin only\n" if _is_admin(_uid(message) or -1) else ""
     await message.reply(
-        f"📖 **ULTRA BOT v6 — Help**\n\n"
-        f"**Step 1:** Koi bhi video send karo\n"
-        f"  _(MP4, MKV, AVI, MOV, WEBM, WMV, 3GP)_\n\n"
-        f"**Step 2:** Splitting:\n"
-        f"  `/split N`       → N equal parts  |  `/split 3`\n"
-        f"  `/splitmin N`    → N min chunks   |  `/splitmin 5`\n"
-        f"  `/splitsize N`   → N MB chunks    |  `/splitsize 500`\n"
-        f"  `/splitscene`    → cuts at EVERY shot change (can be many tiny clips —\n"
-        f"                     good for precise editing, not for highlights)\n"
-        f"  `/highlights`    → 🔥 AI reads the dialogue and picks the 5-10 BEST,\n"
-        f"                     most shareable moments (30-60s each) — this is\n"
-        f"                     what you want for viral/highlight clips\n\n"
-        f"**Video tools:**\n"
-        f"  `/trim start end`   → clip a range  |  `/trim 1:00 3:30`\n"
-        f"  `/compress level`   → low · medium · high\n"
-        f"  `/extractaudio`     → save audio as MP3\n"
-        f"  `/mergestart`       → start collecting videos to merge\n"
-        f"  `/mergedone`        → merge the queued videos into one\n"
-        f"  `/mergecancel`      → discard the merge queue\n\n"
-        f"**AI:**\n"
-        f"  `/highlights` → best-moments auto-clipper (see above)\n"
-        f"  `/describe`   → AI description of the loaded video\n"
-        f"  `/aistatus`   → check if AI features are active\n\n"
-        f"**Utils:**\n"
-        f"  `/info`   → loaded video ki details\n"
-        f"  `/status` → kya chal raha hai\n"
-        f"  `/cancel` → rok do\n"
-        f"  `/clear`  → stuck state reset karo\n"
-        f"{admin_line}"
+        "📖 **VIDEO SPLIT PRO v10 — COMMAND CENTER**\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "🎥 **1. Start**\n"
+        "Send a video → wait for download → tap a button.\n\n"
+        "✂️ **2. Split**\n"
+        "`/split 3` → 3 equal parts\n"
+        "`/splitmin 5` → every 5 minutes\n"
+        "`/splitsize 500` → ~500 MB chunks\n"
+        "`/splitscene` → smart scene-based clips\n\n"
+        "🤖 **3. AI**\n"
+        "`/highlights` → transcript + AI ranking + vision check\n"
+        "`/describe` → AI description\n"
+        "`/aistatus` → AI availability/model\n\n"
+        "🎬 **4. Video Tools**\n"
+        "`/trim 1:00 3:30` → cut a time range\n"
+        "`/compress medium` → low/medium/high compression\n"
+        "`/extractaudio` → MP3 audio\n\n"
+        "🔗 **5. Merge**\n"
+        "`/mergestart` → collect videos\n"
+        "`/mergedone` → merge queue\n"
+        "`/mergecancel` → clear queue\n\n"
+        "🛠 **6. Control & Recovery**\n"
+        "`/info` → file details + suggestions\n"
+        "`/status` → current task/progress\n"
+        "`/cancel` → stop current task\n"
+        "`/clear` → reset idle/stuck state\n\n"
+        "📊 **Admin**\n"
+        "`/stats` → bot statistics\n"
+        "`/broadcast text` → admin broadcast\n\n"
+        "💡 **Tip:** Buttons are the easiest way — tap **📖 All Commands** or send `/start`.\n"
+        "⚡ Designed for large videos and Render Free resource limits.",
+        reply_markup=_main_menu_kb(),
     )
 
 @app.on_message(filters.command("info"), group=1)
@@ -1713,6 +2111,25 @@ async def cmd_clear(client, message):
 
 
 # ══════════════════════════════════════════════════════════════
+#  LARGE-FILE PREFLIGHT
+# ══════════════════════════════════════════════════════════════
+def _preflight_large_file(file_size: int) -> tuple[bool, str]:
+    """Fail early instead of letting a nearly-full filesystem look stuck."""
+    if file_size and file_size > MAX_INPUT_BYTES:
+        return False, f"File too large: `{_sz(file_size)}`. Limit is about `{_sz(MAX_INPUT_BYTES)}`."
+    try:
+        free = shutil.disk_usage(DOWNLOAD_DIR).free
+    except Exception:
+        return True, ""
+    if file_size and free < file_size + DISK_SAFETY_BYTES:
+        return False, (
+            f"Server storage low. Need about `{_sz(file_size + DISK_SAFETY_BYTES)}` free, "
+            f"but only `{_sz(free)}` is available."
+        )
+    return True, ""
+
+
+# ══════════════════════════════════════════════════════════════
 #  RECEIVE VIDEO
 #  group=-1 ensures this runs BEFORE command handlers (group=1)
 #  ~filters.command(COMMAND_LIST) prevents overlap with commands
@@ -1736,6 +2153,13 @@ async def receive(client, message):
 
     mime      = getattr(media, "mime_type", "") or ""
     file_size = getattr(media, "file_size", 0) or 0
+
+    ok_preflight, preflight_reason = _preflight_large_file(file_size)
+    if not ok_preflight:
+        return await message.reply(
+            f"❌ **Cannot start safely**\n{preflight_reason}\n\n"
+            "Try a smaller file or free server storage first."
+        )
 
     # Filter: only accept video-like MIME types
     if mime and not (mime.startswith("video/") or mime == "application/octet-stream"):
@@ -1858,6 +2282,14 @@ async def receive(client, message):
         _reset(uid)
         _clear_status(uid)
         user_files[uid] = path
+        user_sources[uid] = {"chat_id": message.chat.id, "source_message_id": message.id, "source_path": path}
+        # Persistent source record lets recovery re-download the original from Telegram after a Render restart.
+        try:
+            old = await _source_for(uid)
+            if old: await _job_delete(old["job_id"])
+            await _job_create(uid, message.chat.id, message.id, "source", {"stage":"ready"}, path, job_id=uuid.uuid4().hex[:16])
+        except Exception as e:
+            log.warning("Could not persist source checkpoint: %s", e)
         _track_video_processed()
         await _safe_edit(status,
             f"✅ **Download complete!**\n"
@@ -1902,6 +2334,39 @@ async def _quick_split(message, uid: int, parts: int) -> None:
                         label=f"Splitting into {parts} equal parts…")
 
 
+def _scene_segments_from_cuts(cuts: list[float], duration: float) -> list[tuple[float, float]]:
+    """Turn scene boundaries into sane segments and eliminate edge fragments."""
+    if duration <= 0:
+        return []
+    min_len = max(2.5, SCENE_MIN_GAP_SEC)
+    clean = sorted({round(float(c), 2) for c in cuts if 0.0 < float(c) < duration})
+
+    # A cut very close to the beginning/end creates a useless tiny clip.
+    clean = [c for c in clean if c >= min_len * 0.75 and duration - c >= min_len * 0.75]
+
+    # Re-run spacing after edge cleanup.
+    spaced: list[float] = []
+    for c in clean:
+        if not spaced or c - spaced[-1] >= min_len:
+            spaced.append(c)
+
+    bounds = [0.0] + spaced + [duration]
+    segments: list[tuple[float, float]] = []
+    for a, b in zip(bounds, bounds[1:]):
+        d = b - a
+        if d < min_len * 0.75 and segments:
+            # Merge a tiny tail into the previous scene.
+            prev_start, prev_dur = segments[-1]
+            segments[-1] = (prev_start, b - prev_start)
+        elif d >= min_len * 0.75:
+            segments.append((a, d))
+
+    # Safety fallback: never return an empty result for a valid video.
+    if not segments and duration > 0:
+        return [(0.0, duration)]
+    return segments
+
+
 async def _quick_splitscene(message, uid: int) -> None:
     lock = _get_lock(uid)
     if lock.locked():
@@ -1919,26 +2384,31 @@ async def _quick_splitscene(message, uid: int) -> None:
         if not dur:
             await message.reply("❌ Video duration nahi mila.")
             return
+        src = user_sources.get(uid) or await _source_for(uid)
+        job_id = await _job_create(uid, message.chat.id, src["source_message_id"], "scene", {"stage":"scan","cuts":[],"segments":[],"next_index":0}, file) if src else None
         scan_msg = await message.reply("🔍 **Scanning for scene changes…**")
         cuts = await detect_scenes(file, uid, scan_msg, dur)
+        if job_id:
+            await _job_update(job_id, payload={"stage":"segments","cuts":cuts,"segments":[],"next_index":0})
         if not cuts:
             await _safe_edit(scan_msg,
                 "❌ Koi clear scene change nahi mila.\n👉 `/split N` try karo instead.")
             return
-        bounds = sorted(set([0.0] + [round(c, 2) for c in cuts if 0 < c < dur] + [dur]))
-        segments = [(bounds[i], bounds[i+1] - bounds[i])
-                    for i in range(len(bounds) - 1) if bounds[i+1] - bounds[i] > 0.5]
+        segments = _scene_segments_from_cuts(cuts, dur)
         if len(segments) < 2:
             await _safe_edit(scan_msg,
                 "❌ Sirf 1 scene mila — poora video ek jaisa hai.\n👉 `/split N` try karo.")
             return
-        if len(segments) > 100:
-            segments = segments[:100]
+        # Absolute safety cap; normal duration-aware detection stays well below this.
+        if len(segments) > SCENE_MAX_COUNT:
+            segments = segments[:SCENE_MAX_COUNT]
         await _safe_edit(scan_msg, f"🎬 **{len(segments)} scenes mile!** Splitting shuru ho raha hai…")
         _track_video_processed()
+        if job_id:
+            await _job_update(job_id, payload={"stage":"split","cuts":cuts,"segments":segments,"next_index":0,"label":f"{len(segments)} scenes — smart scene split…"})
         await _run_split_segments(
-            message, uid, segments, f"{len(segments)} scenes — AI split…",
-            caption_fn=lambda i, t: f"🎬 **Scene {i} / {t}**",
+            message, uid, segments, f"{len(segments)} scenes — smart scene split…",
+            caption_fn=lambda i, t: f"🎬 **Scene {i} / {t}**", job_id=job_id
         )
 
 
@@ -1968,11 +2438,15 @@ async def _quick_highlights(message, uid: int) -> None:
             return
 
         _get_cancel(uid).clear()
+        src = user_sources.get(uid) or await _source_for(uid)
+        job_id = await _job_create(uid, message.chat.id, src["source_message_id"], "highlights", {"stage":"transcribe","segments":[],"highlights":[],"next_index":0}, file) if src else None
         status = await message.reply(
             "🎙 **Audio nikal rahe hain aur samajh rahe hain…**\n"
             "  _(Pura dialogue analyze ho raha hai — thoda time lagega)_"
         )
         segments = await _transcribe_video(file, dur, uid, status)
+        if job_id:
+            await _job_update(job_id, payload={"stage":"select","segments":segments,"highlights":[],"next_index":0})
         if _get_cancel(uid).is_set():
             await _safe_edit(status, "🚫 Cancelled.")
             return
@@ -1986,18 +2460,26 @@ async def _quick_highlights(message, uid: int) -> None:
         await _safe_edit(status,
             f"🧠 **Best clips choose kar rahe hain…** ({len(segments)} dialogue segments mile)")
         highlights = await _select_highlights(segments, dur)
+        if job_id:
+            await _job_update(job_id, payload={"stage":"vision" if HIGHLIGHT_USE_VISION else "split","segments":segments,"highlights":highlights,"next_index":0})
+        if highlights and HIGHLIGHT_USE_VISION and not _get_cancel(uid).is_set():
+            await _safe_edit(status, f"👁️ **Second AI vision check…** ({min(HIGHLIGHT_VISION_CHECKS, len(highlights))} candidates)")
+            highlights = await _vision_rank_highlights(file, uid, highlights)
         if not highlights:
             await _safe_edit(status,
                 "❌ Koi strong highlight nahi mila.\n👉 `/splitscene` ya `/split N` try karo.")
             return
 
-        await _safe_edit(status, f"🔥 **{len(highlights)} best clips mile!** Cutting shuru…")
+        await _safe_edit(status, f"🔥 **{len(highlights)} AI-ranked clips mile!** Cutting shuru…")
+        if job_id:
+            await _job_update(job_id, payload={"stage":"split","segments":[(h["start"], h["end"]-h["start"]) for h in highlights],"highlights":highlights,"next_index":0,"label":f"{len(highlights)} AI-picked highlights…"})
         segs = [(h["start"], h["end"] - h["start"]) for h in highlights]
         reasons = [h["reason"] for h in highlights]
         _track_video_processed()
         await _run_split_segments(
             message, uid, segs, f"{len(highlights)} AI-picked highlights…",
             caption_fn=lambda i, t: f"🔥 **Highlight {i} / {t}**\n_{reasons[i-1]}_",
+            job_id=job_id,
         )
 
 
@@ -2506,6 +2988,45 @@ async def cmd_broadcast(client, message):
 #  any real work, then routes to the exact same shared logic the
 #  text commands use — no separate/duplicated code paths.
 # ══════════════════════════════════════════════════════════════
+async def _menu_text(kind: str):
+    pages = {
+        "split": ("✂️ **SPLIT & SCENE**", "`/split N` — equal parts\n`/splitmin N` — minute chunks\n`/splitsize N` — size chunks\n`/splitscene` — smart scenes\n\n🎯 Scene detection is conservative to avoid the old tiny-clip problem."),
+        "ai": ("🤖 **AI CENTER**", "`/highlights` — multi-stage highlight selection\n`/describe` — describe video\n`/aistatus` — AI status\n\n🧠 Highlights use transcript analysis first, then a second vision check when enabled."),
+        "tools": ("🎬 **VIDEO TOOLS**", "`/trim 1:00 3:30` — trim\n`/compress medium` — compress\n`/extractaudio` — MP3\n\n⚡ Processing shows live status. Use `/cancel` during long jobs."),
+        "merge": ("🔗 **MERGE CENTER**", "1️⃣ `/mergestart`\n2️⃣ Send videos in order\n3️⃣ Tap **Done** or use `/mergedone`\n4️⃣ Use `/mergecancel` to discard\n\nMaximum queue: 20 videos."),
+        "status": ("📊 **STATUS & CONTROL**", "`/info` — current video\n`/status` — current task\n`/cancel` — stop safely\n`/clear` — reset idle state\n\nIf something looks stuck: `/status` → `/cancel` → `/clear`."),
+        "how": ("⚙️ **HOW IT WORKS**", "📥 Download → 💾 save locally → 🎬 FFmpeg/AI processing → 📤 Telegram upload\n\n📈 Progress is throttled to reduce Telegram API overhead.\n🔁 Uploads retry transient failures.\n🧹 Temporary output is cleaned after delivery.\n\n⚠️ Render Free CPU/RAM/network limits can still affect speed."),
+        "help": ("📖 **ALL COMMANDS**", "`/start` `/help`\n`/split` `/splitmin` `/splitsize` `/splitscene`\n`/highlights` `/describe` `/aistatus`\n`/trim` `/compress` `/extractaudio`\n`/mergestart` `/mergedone` `/mergecancel`\n`/info` `/status` `/cancel` `/clear`\n`/retry` `/resume` — recovery\n`/stats` `/broadcast` (admin)"),
+    }
+    return pages.get(kind, pages["help"])
+
+
+def _menu_kb(kind: str):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✂️ Split", callback_data="menu:split"), InlineKeyboardButton("🤖 AI", callback_data="menu:ai")],
+        [InlineKeyboardButton("🎬 Tools", callback_data="menu:tools"), InlineKeyboardButton("🔗 Merge", callback_data="menu:merge")],
+        [InlineKeyboardButton("📊 Status", callback_data="menu:status"), InlineKeyboardButton("📖 Commands", callback_data="menu:help")],
+        [InlineKeyboardButton("🏠 Main Menu", callback_data="menu:home")],
+    ])
+
+
+@app.on_callback_query(filters.regex(r"^menu:(home|split|ai|tools|merge|status|how|help)$"))
+async def cb_menu(client, callback_query):
+    await callback_query.answer()
+    kind = callback_query.data.split(":", 1)[1]
+    if kind == "home":
+        text = "⚡ **VIDEO SPLIT PRO v10**\n━━━━━━━━━━━━━━━━━━━━━━\n🎥 Send a video → choose an action.\n\n👇 Tap a category below:"
+        kb = _main_menu_kb()
+    else:
+        title, body = await _menu_text(kind)
+        text = f"{title}\n━━━━━━━━━━━━━━━━━━━━━━\n{body}"
+        kb = _menu_kb(kind)
+    try:
+        await callback_query.message.edit_text(text, reply_markup=kb)
+    except Exception as e:
+        log.debug("menu edit failed: %s", e)
+
+
 @app.on_callback_query(filters.regex(r"^qs:\d+$"))
 async def cb_quick_split(client, callback_query):
     await callback_query.answer()
@@ -2578,7 +3099,31 @@ def _start_dummy_webserver():
     threading.Thread(target=run, daemon=True).start()
 
 
+async def _startup_recovery():
+    try:
+        await _db_init()
+        jobs=await _job_get_active()
+        if not jobs:
+            return
+        log.warning("♻️ Found %d unfinished job(s); starting automatic recovery.",len(jobs))
+        for job in jobs:
+            try:
+                await _job_update(job["job_id"],state="recovering",attempts_inc=True)
+                ok,why=await _resume_job_record(job)
+                if not ok:
+                    log.warning("Recovery deferred for %s: %s",job["job_id"],why)
+            except Exception:
+                log.exception("Recovery failed for job %s",job["job_id"])
+                await _job_update(job["job_id"],state="retry")
+    except Exception:
+        log.exception("Startup recovery initialization failed")
+
 if __name__ == "__main__":
-    log.info("🚀 Ultra Bot v6 starting…")
+    log.info(f"🚀 Ultra Bot v10 starting… FAST_UPLOAD_MODE={FAST_UPLOAD_MODE} THROTTLE={THROTTLE}s")
+    asyncio.get_event_loop().run_until_complete(_db_init())
     _start_dummy_webserver()
+    async def _boot_recovery():
+        await asyncio.sleep(3)
+        await _startup_recovery()
+    asyncio.get_event_loop().create_task(_boot_recovery())
     app.run()
